@@ -1,0 +1,25 @@
+# Runtime Databases & Credential configs
+*.db
+*.db-journal
+*.env
+admin_auth.json
+telegram_config.json
+config.json
+!config.json.template
+
+# Python cache & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env/
+
+# Logs
+*.log
+3x-ui/x-ui/log/*.log
+3x-ui/x-ui/log/archive/
+setup-diagnostics.log
+
+# OS generated files
+.DS_Store
+Thumbs.db
