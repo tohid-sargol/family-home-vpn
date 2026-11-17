@@ -6,6 +6,8 @@ import json
 import uuid
 import base64
 import socket
+import ssl
+import concurrent.futures
 import sqlite3
 import datetime
 import subprocess
@@ -76,7 +78,23 @@ def get_lan_ip() -> str:
     except Exception:
         return "127.0.0.1"
 
-# Cloudflare Anycast Clean IPs for multi-line resilient fallback
+# Curated pool of 24 verified Cloudflare Anycast CIDR edge IPs across 6 major prefixes
+CLOUDFLARE_EDGE_IP_POOL = [
+    # 104.16.0.0/16
+    "104.16.132.229", "104.16.133.229", "104.16.249.249", "104.16.85.20",
+    # 104.17.0.0/16
+    "104.17.209.9", "104.17.210.9", "104.17.175.22", "104.17.176.22",
+    # 104.18.0.0/16
+    "104.18.2.161", "104.18.3.161", "104.18.15.240", "104.18.43.147",
+    # 104.21.0.0/16
+    "104.21.48.84", "104.21.75.123", "104.21.19.140", "104.21.32.189",
+    # 172.67.0.0/16
+    "172.67.188.112", "172.67.135.150", "172.67.74.152", "172.67.199.234",
+    # 162.159.0.0/16
+    "162.159.135.42", "162.159.136.42", "162.159.36.1", "162.159.38.1"
+]
+
+# Cloudflare Anycast Clean IPs fallback
 DEFAULT_CLEAN_IPS = [
     ("104.16.132.229", "Clean Anycast IP 1 (Verified Low-Latency)"),
     ("172.67.188.112", "Clean Anycast IP 2"),
@@ -211,40 +229,177 @@ def set_invite_code(code: str) -> bool:
         print(f"[DB Error set_invite_code] {e}")
         return False
 
-def get_cf_ip_override() -> str:
+def get_cf_optimizer_state() -> dict:
+    state = {
+        "auto_optimize": True,
+        "active_edge_ip": "104.16.132.229",
+        "latency_ms": 0.0,
+        "last_scan_time": "Never",
+        "top_5_ips": [ip for ip, _ in DEFAULT_CLEAN_IPS],
+        "override_ip": ""
+    }
     try:
         conn = get_db()
         cur = conn.cursor()
-        cur.execute("SELECT value FROM settings WHERE key = 'cf_ip_override'")
-        row = cur.fetchone()
+        cur.execute("SELECT key, value FROM settings WHERE key IN ('cf_auto_optimize', 'cf_active_edge_ip', 'cf_scan_latency_ms', 'cf_last_scan_time', 'cf_top_5_ips', 'cf_ip_override')")
+        rows = cur.fetchall()
         conn.close()
-        if row and row["value"]:
-            return row["value"].strip()
-    except Exception as e:
-        print(f"[DB Error get_cf_ip_override] {e}")
-    return ""
+        db_map = {row["key"]: row["value"] for row in rows}
 
-def set_cf_ip_override(ip: str) -> bool:
+        if "cf_auto_optimize" in db_map:
+            state["auto_optimize"] = (db_map["cf_auto_optimize"] == "1")
+        if "cf_active_edge_ip" in db_map and db_map["cf_active_edge_ip"]:
+            state["active_edge_ip"] = db_map["cf_active_edge_ip"].strip()
+        if "cf_scan_latency_ms" in db_map and db_map["cf_scan_latency_ms"]:
+            try:
+                state["latency_ms"] = float(db_map["cf_scan_latency_ms"])
+            except ValueError:
+                pass
+        if "cf_last_scan_time" in db_map and db_map["cf_last_scan_time"]:
+            state["last_scan_time"] = db_map["cf_last_scan_time"]
+        if "cf_top_5_ips" in db_map and db_map["cf_top_5_ips"]:
+            try:
+                loaded = json.loads(db_map["cf_top_5_ips"])
+                if isinstance(loaded, list) and len(loaded) > 0:
+                    state["top_5_ips"] = loaded
+            except Exception:
+                pass
+        if "cf_ip_override" in db_map:
+            state["override_ip"] = db_map["cf_ip_override"].strip()
+    except Exception as e:
+        print(f"[DB Error get_cf_optimizer_state] {e}")
+
+    return state
+
+def save_cf_optimizer_state(data: dict) -> bool:
     try:
-        ip_clean = ip.strip()
         conn = get_db()
         cur = conn.cursor()
-        cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('cf_ip_override', ?)", (ip_clean,))
+        if "auto_optimize" in data:
+            val = "1" if data["auto_optimize"] else "0"
+            cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('cf_auto_optimize', ?)", (val,))
+        if "active_edge_ip" in data:
+            cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('cf_active_edge_ip', ?)", (data["active_edge_ip"].strip(),))
+        if "latency_ms" in data:
+            cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('cf_scan_latency_ms', ?)", (str(data["latency_ms"]),))
+        if "last_scan_time" in data:
+            cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('cf_last_scan_time', ?)", (data["last_scan_time"],))
+        if "top_5_ips" in data:
+            cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('cf_top_5_ips', ?)", (json.dumps(data["top_5_ips"]),))
+        if "override_ip" in data:
+            cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('cf_ip_override', ?)", (data["override_ip"].strip(),))
         conn.commit()
         conn.close()
+
+        # Sync to config.json
+        try:
+            cfg = {}
+            if os.path.exists(CONFIG_FILE):
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+            if "auto_optimize" in data:
+                cfg["CF_AUTO_OPTIMIZE"] = data["auto_optimize"]
+            if "active_edge_ip" in data:
+                cfg["CF_ACTIVE_EDGE_IP"] = data["active_edge_ip"]
+            if "latency_ms" in data:
+                cfg["CF_LATENCY_MS"] = data["latency_ms"]
+            if "last_scan_time" in data:
+                cfg["CF_LAST_SCAN_TIME"] = data["last_scan_time"]
+            if "top_5_ips" in data:
+                cfg["CF_TOP_5_IPS"] = data["top_5_ips"]
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2)
+        except Exception:
+            pass
+
         return True
     except Exception as e:
-        print(f"[DB Error set_cf_ip_override] {e}")
+        print(f"[DB Error save_cf_optimizer_state] {e}")
         return False
 
+def get_cf_ip_override() -> str:
+    return get_cf_optimizer_state().get("override_ip", "")
+
+def set_cf_ip_override(ip: str) -> bool:
+    clean = ip.strip()
+    return save_cf_optimizer_state({"override_ip": clean, "auto_optimize": False if clean else True})
+
+def set_cf_auto_optimize(enabled: bool) -> bool:
+    return save_cf_optimizer_state({"auto_optimize": enabled})
+
+def test_single_cf_ip(ip: str, sni: str, timeout: float = 2.5) -> tuple[str, Optional[float]]:
+    t0 = time.monotonic()
+    try:
+        sock = socket.create_connection((ip, 443), timeout=timeout)
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with ctx.wrap_socket(sock, server_hostname=sni or "trycloudflare.com"):
+            latency = (time.monotonic() - t0) * 1000.0
+            return ip, round(latency, 1)
+    except Exception:
+        return ip, None
+
+def run_cloudflare_ip_scan() -> dict:
+    sni = tunnel_state.get("vpn_host") or tunnel_state.get("portal_host") or "trycloudflare.com"
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        futures = [ex.submit(test_single_cf_ip, ip, sni) for ip in CLOUDFLARE_EDGE_IP_POOL]
+        results = [f.result() for f in concurrent.futures.as_completed(futures)]
+
+    responsive = [(ip, lat) for ip, lat in results if lat is not None]
+    responsive.sort(key=lambda x: x[1])
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    if not responsive:
+        return {
+            "success": False,
+            "timestamp": now_str,
+            "active_ip": DEFAULT_CLEAN_IPS[0][0],
+            "latency_ms": 0.0,
+            "top_5": [ip for ip, _ in DEFAULT_CLEAN_IPS]
+        }
+
+    top_5 = responsive[:5]
+    best_ip, best_lat = top_5[0]
+    top_5_ips = [ip for ip, _ in top_5]
+
+    save_cf_optimizer_state({
+        "active_edge_ip": best_ip,
+        "latency_ms": best_lat,
+        "last_scan_time": now_str,
+        "top_5_ips": top_5_ips
+    })
+
+    return {
+        "success": True,
+        "timestamp": now_str,
+        "active_ip": best_ip,
+        "latency_ms": best_lat,
+        "top_5": top_5_ips
+    }
+
 def get_active_clean_ips() -> List[tuple[str, str]]:
-    override = get_cf_ip_override()
-    if override:
-        res = [(override, f"Fastest Override ({override})")]
+    state = get_cf_optimizer_state()
+    auto_enabled = state.get("auto_optimize", True)
+    override = state.get("override_ip", "")
+
+    if not auto_enabled and override:
+        res = [(override, f"Manual Override ({override})")]
         for ip, label in DEFAULT_CLEAN_IPS:
             if ip != override:
                 res.append((ip, label))
+        return res[:5]
+
+    top_5 = state.get("top_5_ips", [])
+    lat = state.get("latency_ms", 0.0)
+    lat_str = f" ({lat}ms)" if lat > 0 else ""
+    if top_5:
+        primary = top_5[0]
+        res = [(primary, f"Auto-Promoted Fastest IP{lat_str}")]
+        for idx, ip in enumerate(top_5[1:], start=2):
+            res.append((ip, f"Clean Anycast IP #{idx} ({ip})"))
         return res
+
     return DEFAULT_CLEAN_IPS
 
 # ----------------- Admin Auth File Sync ----------------- #
@@ -1117,6 +1272,22 @@ def watchdog_loop():
 
 threading.Thread(target=watchdog_loop, daemon=True).start()
 
+def cf_optimizer_scheduler():
+    time.sleep(3)  # Initial grace period to allow tunnel and network to stabilize
+    while True:
+        try:
+            state = get_cf_optimizer_state()
+            if state.get("auto_optimize", True):
+                print("[CF Optimizer] Running automated edge IP latency scan across 24 Anycast candidates...")
+                scan_res = run_cloudflare_ip_scan()
+                active_ips = get_active_clean_ips()
+                print(f"[CF Optimizer] Scan complete. Primary Edge IP promoted: {active_ips[0][0]} ({scan_res.get('latency_ms', 0)} ms)")
+        except Exception as e:
+            print(f"[CF Optimizer Scheduler Exception] {e}")
+        time.sleep(900)  # Repeat every 15 minutes
+
+threading.Thread(target=cf_optimizer_scheduler, daemon=True).start()
+
 # ----------------- Subscription Generation & Profile Builder ----------------- #
 
 def format_bytes(b: int) -> str:
@@ -1816,8 +1987,12 @@ def api_admin_overview():
         "vpn_host": tunnel_state.get("vpn_host") or "Pending...",
         "portal_url": tunnel_state.get("portal_url") or "Connecting...",
         "portal_host": tunnel_state.get("portal_host") or "Pending...",
+        "cf_auto_optimize": get_cf_optimizer_state().get("auto_optimize", True),
         "cf_ip_override": get_cf_ip_override(),
-        "active_clean_ip": get_active_clean_ips()[0][0],
+        "cf_active_edge_ip": get_active_clean_ips()[0][0],
+        "cf_latency_ms": get_cf_optimizer_state().get("latency_ms", 0.0),
+        "cf_last_scan_time": get_cf_optimizer_state().get("last_scan_time", "Never"),
+        "cf_top_5": [ip for ip, _ in get_active_clean_ips()],
         "last_sync": tunnel_state.get("last_sync", "Never")
     }
 
@@ -1853,12 +2028,58 @@ def api_set_invite_code(req: InviteCodeReq):
         return {"success": True, "invite_code": req.invite_code.strip()}
     raise HTTPException(status_code=400, detail="Invalid invite code")
 
+# ----------------- Automated Cloudflare Optimizer Endpoints ----------------- #
+
+@app.get("/api/admin/cf-optimizer")
+def api_get_cf_optimizer():
+    state = get_cf_optimizer_state()
+    active_ips = get_active_clean_ips()
+    return {
+        "auto_optimize": state.get("auto_optimize", True),
+        "active_ip": active_ips[0][0],
+        "latency_ms": state.get("latency_ms", 0.0),
+        "last_scan_time": state.get("last_scan_time", "Never"),
+        "top_5": [ip for ip, _ in active_ips],
+        "override_ip": state.get("override_ip", ""),
+        "pool_size": len(CLOUDFLARE_EDGE_IP_POOL)
+    }
+
+class CfOptimizerToggleReq(BaseModel):
+    auto_optimize: Optional[bool] = None
+    override_ip: Optional[str] = None
+
+@app.post("/api/admin/cf-optimizer")
+def api_set_cf_optimizer(req: CfOptimizerToggleReq):
+    if req.auto_optimize is not None:
+        set_cf_auto_optimize(req.auto_optimize)
+    if req.override_ip is not None:
+        set_cf_ip_override(req.override_ip)
+
+    if req.auto_optimize:
+        threading.Thread(target=run_cloudflare_ip_scan, daemon=True).start()
+
+    return api_get_cf_optimizer()
+
+@app.post("/api/admin/cf-optimizer/scan")
+def api_scan_cf_optimizer():
+    result = run_cloudflare_ip_scan()
+    best_ip = result.get("active_ip")
+    lat = result.get("latency_ms", 0.0)
+    send_telegram_alert_async(
+        f"⚡ <b>Fastest Cloudflare Edge IP Promoted!</b>\n"
+        f"Promoted IP: <code>{best_ip}</code> ({lat} ms)\n"
+        f"All family subscription links updated."
+    )
+    return api_get_cf_optimizer()
+
 @app.get("/api/admin/cf-ip-override")
 def api_get_cf_ip_override():
+    state = get_cf_optimizer_state()
+    active_ips = get_active_clean_ips()
     return {
-        "ip": get_cf_ip_override(),
+        "ip": state.get("override_ip", ""),
         "default_ip": "104.16.132.229",
-        "active_ip": get_active_clean_ips()[0][0]
+        "active_ip": active_ips[0][0]
     }
 
 class CfIpOverrideReq(BaseModel):
@@ -1866,17 +2087,15 @@ class CfIpOverrideReq(BaseModel):
 
 @app.post("/api/admin/cf-ip-override")
 def api_set_cf_ip_override(req: CfIpOverrideReq):
-    success = set_cf_ip_override(req.ip)
-    if success:
-        clean_ip = req.ip.strip()
-        if clean_ip:
-            send_telegram_alert_async(
-                f"⚡ <b>Fastest Cloudflare IP Updated!</b>\n"
-                f"Active Anycast IP: <code>{clean_ip}</code>\n"
-                f"All family subscription links auto-updated."
-            )
-        return {"success": True, "ip": clean_ip, "active_ip": get_active_clean_ips()[0][0]}
-    raise HTTPException(status_code=400, detail="Failed to save Cloudflare IP override")
+    clean_ip = req.ip.strip()
+    set_cf_ip_override(clean_ip)
+    if clean_ip:
+        send_telegram_alert_async(
+            f"⚡ <b>Fastest Cloudflare IP Updated!</b>\n"
+            f"Active Anycast IP: <code>{clean_ip}</code>\n"
+            f"All family subscription links auto-updated."
+        )
+    return {"success": True, "ip": clean_ip, "active_ip": get_active_clean_ips()[0][0]}
 
 @app.get("/api/clients")
 def list_clients():
@@ -3651,25 +3870,41 @@ ADMIN_PAGE_HTML = f"""<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- Fastest Cloudflare IP Override Card -->
+    <!-- Automated Cloudflare Clean Edge IP & Speed Optimizer Card -->
     <div class="glass-card p-6 rounded-3xl border border-cyan-900/60 bg-gradient-to-r from-cyan-950/60 via-slate-900/80 to-slate-900/60 shadow-2xl flex flex-col md:flex-row items-center justify-between gap-5">
-      <div class="space-y-1.5 text-start w-full">
+      <div class="space-y-2 text-start w-full">
         <div class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-cyan-600/20 text-cyan-300 border border-cyan-500/30 text-[11px] font-bold">
-          <span id="txtCfIpBadge">بهینه‌سازی سرعت و Anycast Clean IP</span>
+          <span id="txtCfIpBadge">بهینه‌سازی خودکار سرعت و Clean Edge IP</span>
         </div>
         <h3 class="text-lg font-bold text-white flex items-center gap-2 flex-wrap">
           <span id="lblCfIpTitle">آی‌پی کلودفلر فعال (پروفایل ۱):</span>
           <span id="txtActiveCfIp" class="font-mono text-base text-cyan-300 bg-cyan-950/90 px-3 py-0.5 rounded-xl border border-cyan-700/60">104.16.132.229</span>
-          <span id="txtCfIpType" class="text-[10px] text-cyan-300 bg-cyan-950/80 px-2 py-0.5 rounded-lg border border-cyan-700/60">پیش‌فرض Anycast</span>
+          <span id="txtCfIpType" class="text-[10px] text-emerald-300 bg-emerald-950/80 px-2 py-0.5 rounded-lg border border-emerald-700/60 font-semibold">ارتقای خودکار</span>
+          <span id="txtCfLatency" class="text-[10px] text-cyan-300 bg-cyan-950/80 px-2 py-0.5 rounded-lg border border-cyan-700/60 font-mono">-- ms</span>
         </h3>
-        <p id="txtCfIpDesc" class="text-xs text-slate-300 max-w-2xl leading-relaxed">آی‌پی تمیز کلودفلر با کمترین پینگ روی ایرانسل/همراه‌اول را در کادر زیر وارد کنید تا بلافاصله به عنوان مسیر شماره ۱ تمام لینک‌های اشتراک خانواده تنظیم شود.</p>
+        <p id="txtCfIpDesc" class="text-xs text-slate-300 max-w-2xl leading-relaxed">اسکنر هوشمند هر ۱۵ دقیقه پینگ و پایداری ۲۴ آی‌پی Anycast کلودفلر را بررسی کرده و سریع‌ترین آی‌پی را به عنوان پروفایل شماره ۱ به اشتراک‌های خانواده ارتقا می‌دهد.</p>
+        <div class="flex items-center gap-4 pt-1 text-[11px] text-slate-400 flex-wrap">
+          <label class="flex items-center gap-2 cursor-pointer select-none">
+            <input type="checkbox" id="chkCfAutoOptimize" onchange="toggleCfAutoOptimize(this.checked)" class="w-4 h-4 rounded text-cyan-500 bg-slate-900 border-slate-700 focus:ring-cyan-500" checked>
+            <span id="lblAutoOptimizeText" class="text-slate-200 font-semibold">بهینه‌سازی خودکار (هر ۱۵ دقیقه)</span>
+          </label>
+          <span class="text-slate-600">|</span>
+          <div class="flex items-center gap-1">
+            <span id="lblLastScanText">آخرین اسکن:</span>
+            <span id="txtCfLastScan" class="font-mono text-cyan-400">Never</span>
+          </div>
+        </div>
       </div>
 
       <div class="flex flex-col sm:flex-row items-center gap-2.5 w-full md:w-auto shrink-0">
-        <input type="text" id="inpCfIpOverride" placeholder="e.g. 104.16.132.229" class="w-full sm:w-48 px-3.5 py-2.5 rounded-2xl bg-slate-950/80 border border-slate-700 text-cyan-300 font-mono text-xs focus:outline-none focus:border-cyan-500 transition placeholder:text-slate-600">
-        <button onclick="saveCfIpOverride()" class="w-full sm:w-auto px-4 py-2.5 rounded-2xl bg-cyan-600 hover:bg-cyan-500 text-white font-bold text-xs shadow-lg shadow-cyan-600/30 transition flex items-center justify-center gap-1.5 whitespace-nowrap">
+        <button id="btnScanNow" onclick="triggerCfScanNow()" class="w-full sm:w-auto px-4 py-2.5 rounded-2xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs shadow-lg shadow-emerald-600/30 transition flex items-center justify-center gap-1.5 whitespace-nowrap">
+          <svg id="svgScanSpin" class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+          <span id="btnScanNowText">اسکن و ارتقای فوری</span>
+        </button>
+        <input type="text" id="inpCfIpOverride" placeholder="e.g. 104.16.132.229" class="w-full sm:w-44 px-3 py-2.5 rounded-2xl bg-slate-950/80 border border-slate-700 text-cyan-300 font-mono text-xs focus:outline-none focus:border-cyan-500 transition placeholder:text-slate-600">
+        <button onclick="saveCfIpOverride()" class="w-full sm:w-auto px-3.5 py-2.5 rounded-2xl bg-cyan-600 hover:bg-cyan-500 text-white font-bold text-xs shadow-lg shadow-cyan-600/30 transition flex items-center justify-center gap-1 whitespace-nowrap">
           <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>
-          <span id="btnSaveCfIpText">ذخیره و اعمال</span>
+          <span id="btnSaveCfIpText">ثبت دستی</span>
         </button>
         <button onclick="resetCfIpOverride()" class="w-full sm:w-auto px-3 py-2.5 rounded-2xl bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white font-medium text-xs border border-slate-700 transition flex items-center justify-center gap-1 whitespace-nowrap">
           <span id="btnResetCfIpText">بازنشانی</span>
@@ -3985,12 +4220,15 @@ ADMIN_PAGE_HTML = f"""<!DOCTYPE html>
         inviteDesc: 'این لینک و کد را برای اعضای خانواده بفرستید تا بتوانند مستقیماً از گوشی ثبت‌نام کرده و اشتراک هوشمند دریافت کنند.',
         btnCopyInvite: 'کپی لینک دعوت و متن آماده',
 
-        // Clean IP Override
-        cfIpBadge: 'بهینه‌سازی سرعت و Anycast Clean IP',
+        // Automated Clean Edge IP Optimizer
+        cfIpBadge: 'بهینه‌سازی خودکار سرعت و Clean Edge IP',
         cfIpTitle: 'آی‌پی کلودفلر فعال (پروفایل ۱):',
-        cfIpDesc: 'آی‌پی تمیز کلودفلر با کمترین پینگ روی ایرانسل/همراه‌اول را در کادر زیر وارد کنید تا بلافاصله به عنوان مسیر شماره ۱ تمام لینک‌های اشتراک خانواده تنظیم شود.',
-        btnSaveCfIpText: 'ذخیره و اعمال',
-        btnResetCfIpText: 'بازنشانی',
+        cfIpDesc: 'اسکنر هوشمند هر ۱۵ دقیقه پینگ و پایداری ۲۴ آی‌پی Anycast کلودفلر را بررسی کرده و سریع‌ترین آی‌پی را به عنوان پروفایل شماره ۱ به اشتراک‌های خانواده ارتقا می‌دهد.',
+        lblAutoOptimizeText: 'بهینه‌سازی خودکار (هر ۱۵ دقیقه)',
+        lblLastScanText: 'آخرین اسکن:',
+        btnScanNowText: 'اسکن و ارتقای فوری',
+        btnSaveCfIpText: 'ثبت دستی',
+        btnResetCfIpText: 'بازنشانی به خودکار',
 
         // Failing Domains
         failingTitle: 'شناسایی دامنه‌های دچار اختلال یا نشتی به ایرلند',
@@ -4109,12 +4347,15 @@ ADMIN_PAGE_HTML = f"""<!DOCTYPE html>
         inviteDesc: 'Share this link and invite code with family members so they can register and get a ready-to-use VPN profile with zero setup.',
         btnCopyInvite: 'Copy Invite Link & Instructions',
 
-        // Clean IP Override
-        cfIpBadge: 'Cloudflare Clean IP & Speed Tuning',
+        // Automated Clean Edge IP Optimizer
+        cfIpBadge: 'Automated Clean Edge IP & Speed Optimizer',
         cfIpTitle: 'Active Cloudflare Edge IP (Profile #1):',
-        cfIpDesc: 'Paste any verified low-latency Cloudflare Anycast IP to immediately prioritize it as the #1 profile in all family subscriptions.',
-        btnSaveCfIpText: 'Save & Push',
-        btnResetCfIpText: 'Reset to Default',
+        cfIpDesc: 'Background worker scans 24 Cloudflare Anycast edge IPs every 15 minutes, auto-promoting the lowest-latency edge IP as Profile #1 for family subscriptions.',
+        lblAutoOptimizeText: 'Auto-Optimize (Every 15m)',
+        lblLastScanText: 'Last Scan:',
+        btnScanNowText: 'Scan & Promote Now',
+        btnSaveCfIpText: 'Save Manual',
+        btnResetCfIpText: 'Reset to Auto',
 
         // Failing Domains
         failingTitle: 'Detected Blocked, Failing & Leaked Domains',
@@ -4274,6 +4515,9 @@ ADMIN_PAGE_HTML = f"""<!DOCTYPE html>
       setTxt('txtCfIpBadge', dict.cfIpBadge);
       setTxt('lblCfIpTitle', dict.cfIpTitle);
       setTxt('txtCfIpDesc', dict.cfIpDesc);
+      setTxt('lblAutoOptimizeText', dict.lblAutoOptimizeText);
+      setTxt('lblLastScanText', dict.lblLastScanText);
+      setTxt('btnScanNowText', dict.btnScanNowText);
       setTxt('btnSaveCfIpText', dict.btnSaveCfIpText);
       setTxt('btnResetCfIpText', dict.btnResetCfIpText);
 
@@ -4353,16 +4597,29 @@ ADMIN_PAGE_HTML = f"""<!DOCTYPE html>
         currentPublicUrl = d.portal_url || '';
 
         document.getElementById('txtCurrentInviteCode').textContent = d.invite_code;
-        if (d.cf_ip_override) {{
+        const autoOpt = (d.cf_auto_optimize !== false);
+        const chkAuto = document.getElementById('chkCfAutoOptimize');
+        if (chkAuto) chkAuto.checked = autoOpt;
+
+        document.getElementById('txtActiveCfIp').textContent = d.cf_active_edge_ip || '104.16.132.229';
+
+        if (autoOpt) {{
+          document.getElementById('txtCfIpType').textContent = (currentLang === 'fa' ? 'ارتقای خودکار' : 'Auto-Promoted');
+          document.getElementById('txtCfIpType').className = 'text-[10px] text-emerald-300 bg-emerald-950/80 px-2 py-0.5 rounded-lg border border-emerald-700/60 font-semibold';
+          document.getElementById('txtCfLatency').textContent = d.cf_latency_ms ? (d.cf_latency_ms + ' ms') : '-- ms';
+          document.getElementById('txtCfLatency').className = 'text-[10px] text-cyan-300 bg-cyan-950/80 px-2 py-0.5 rounded-lg border border-cyan-700/60 font-mono';
+        }} else if (d.cf_ip_override) {{
           document.getElementById('txtActiveCfIp').textContent = d.cf_ip_override;
-          document.getElementById('txtCfIpType').textContent = (currentLang === 'fa' ? 'شخصی‌سازی شده (Override)' : 'Custom Override');
-          document.getElementById('txtCfIpType').className = 'text-[10px] text-amber-300 bg-amber-950/80 px-2 py-0.5 rounded-lg border border-amber-700/60';
-          document.getElementById('inpCfIpOverride').value = d.cf_ip_override;
+          document.getElementById('txtCfIpType').textContent = (currentLang === 'fa' ? 'شخصی‌سازی دستی' : 'Manual Override');
+          document.getElementById('txtCfIpType').className = 'text-[10px] text-amber-300 bg-amber-950/80 px-2 py-0.5 rounded-lg border border-amber-700/60 font-semibold';
+          document.getElementById('txtCfLatency').textContent = '-- ms';
         }} else {{
-          document.getElementById('txtActiveCfIp').textContent = '104.16.132.229';
           document.getElementById('txtCfIpType').textContent = (currentLang === 'fa' ? 'پیش‌فرض Anycast' : 'Default Anycast');
-          document.getElementById('txtCfIpType').className = 'text-[10px] text-cyan-300 bg-cyan-950/80 px-2 py-0.5 rounded-lg border border-cyan-700/60';
+          document.getElementById('txtCfIpType').className = 'text-[10px] text-cyan-300 bg-cyan-950/80 px-2 py-0.5 rounded-lg border border-cyan-700/60 font-semibold';
+          document.getElementById('txtCfLatency').textContent = '-- ms';
         }}
+        document.getElementById('inpCfIpOverride').value = d.cf_ip_override || '';
+        document.getElementById('txtCfLastScan').textContent = d.cf_last_scan_time || 'Never';
         document.getElementById('valLocalUrl').textContent = currentLocalUrl;
         document.getElementById('valLanUrl').textContent = currentLanUrl;
         document.getElementById('valPublicUrl').textContent = currentPublicUrl || (currentLang === 'fa' ? 'در حال برقراری ارتباط...' : 'Connecting...');
@@ -4557,6 +4814,44 @@ Open the link and enter your invite code to get your personal VPN profile!`;
       }}
     }}
 
+    async function toggleCfAutoOptimize(enabled) {{
+      try {{
+        const res = await fetch('/api/admin/cf-optimizer', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ auto_optimize: enabled }})
+        }});
+        if (res.ok) {{
+          fetchAdminOverview();
+        }}
+      }} catch (e) {{
+        alert('Error: ' + e);
+      }}
+    }}
+
+    async function triggerCfScanNow() {{
+      const btn = document.getElementById('btnScanNow');
+      const svg = document.getElementById('svgScanSpin');
+      if (svg) svg.classList.add('animate-spin');
+      if (btn) btn.disabled = true;
+      try {{
+        const res = await fetch('/api/admin/cf-optimizer/scan', {{ method: 'POST' }});
+        if (res.ok) {{
+          const d = await res.json();
+          fetchAdminOverview();
+          const msg = (currentLang === 'fa' 
+            ? `اسکن با موفقیت انجام شد!\nسریع‌ترین آی‌پی: ${{d.active_ip}} (${{d.latency_ms}} ms)\nاین آی‌پی به عنوان پروفایل ۱ به تمام اشتراک‌ها ارتقا داده شد.`
+            : `Scan complete!\nFastest IP: ${{d.active_ip}} (${{d.latency_ms}} ms)\nAuto-promoted as Profile #1 in all subscriptions.`);
+          alert(msg);
+        }}
+      }} catch (e) {{
+        alert('Scan error: ' + e);
+      }} finally {{
+        if (svg) svg.classList.remove('animate-spin');
+        if (btn) btn.disabled = false;
+      }}
+    }}
+
     async function saveCfIpOverride() {{
       const ip = document.getElementById('inpCfIpOverride').value.trim();
       if (!ip) {{
@@ -4564,13 +4859,13 @@ Open the link and enter your invite code to get your personal VPN profile!`;
         return;
       }}
       try {{
-        const res = await fetch('/api/admin/cf-ip-override', {{
+        const res = await fetch('/api/admin/cf-optimizer', {{
           method: 'POST',
           headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ ip }})
+          body: JSON.stringify({{ auto_optimize: false, override_ip: ip }})
         }});
         if (res.ok) {{
-          alert(currentLang === 'fa' ? `آی‌پی ${{ip}} با موفقیت به عنوان مسیر اصلی ذخیره شد و در تمام لینک‌های اشتراک اعمال گردید!` : `Cloudflare IP ${{ip}} saved and pushed to all subscription links!`);
+          alert(currentLang === 'fa' ? `آی‌پی دستی (${{ip}}) با موفقیت به عنوان مسیر اصلی ذخیره شد و در تمام لینک‌های اشتراک اعمال گردید!` : `Cloudflare IP (${{ip}}) saved and pushed to all subscription links!`);
           fetchAdminOverview();
         }} else {{
           const err = await res.json();
@@ -4582,18 +4877,18 @@ Open the link and enter your invite code to get your personal VPN profile!`;
     }}
 
     async function resetCfIpOverride() {{
-      const confirmMsg = currentLang === 'fa' ? 'آیا مایل به بازنشانی آی‌پی به مقدار پیش‌فرض (104.16.132.229) هستید؟' : 'Reset Cloudflare IP to default (104.16.132.229)?';
+      const confirmMsg = currentLang === 'fa' ? 'آیا مایل به بازگشت به بهینه‌سازی خودکار سریع‌ترین آی‌پی هستید؟' : 'Revert to automated lowest-latency IP optimizer?';
       if (!confirm(confirmMsg)) return;
       try {{
-        const res = await fetch('/api/admin/cf-ip-override', {{
+        const res = await fetch('/api/admin/cf-optimizer', {{
           method: 'POST',
           headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ ip: '' }})
+          body: JSON.stringify({{ auto_optimize: true, override_ip: '' }})
         }});
         if (res.ok) {{
           document.getElementById('inpCfIpOverride').value = '';
           fetchAdminOverview();
-          alert(currentLang === 'fa' ? 'آی‌پی به حالت پیش‌فرض (104.16.132.229) بازنشانی شد.' : 'Reset to default Clean IP (104.16.132.229).');
+          alert(currentLang === 'fa' ? 'سیستم با موفقیت به حالت بهینه‌سازی خودکار بازگشت.' : 'Reverted to automated edge IP optimizer.');
         }}
       }} catch (e) {{
         alert('Error: ' + e);

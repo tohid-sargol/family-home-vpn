@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Home VPN Platform - Zero-Touch Self-Healing Installer & Diagnostics
 .DESCRIPTION
