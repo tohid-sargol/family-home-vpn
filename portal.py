@@ -1,5 +1,15 @@
 import os
 import sys
+
+# Safe stdout/stderr handling for Windows background/GUI launcher (wscript/pythonw)
+try:
+    if sys.stdout is None or not hasattr(sys.stdout, "write"):
+        log_f = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "portal.log"), "a", encoding="utf-8")
+        sys.stdout = log_f
+        sys.stderr = log_f
+except Exception:
+    pass
+
 import re
 import time
 import json
@@ -54,7 +64,7 @@ CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 portal_config: Dict[str, Any] = {}
 if os.path.exists(CONFIG_FILE):
     try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+        with open(CONFIG_FILE, "r", encoding="utf-8-sig") as f:
             portal_config = json.load(f)
     except Exception as e:
         print(f"[Config Load Error] {e}")
@@ -175,8 +185,12 @@ def init_portal_db():
     # Ensure invite_code exists in settings
     cur.execute("SELECT value FROM settings WHERE key = 'invite_code'")
     row = cur.fetchone()
+    default_code = portal_config.get("INVITE_CODE") or "FAMILY2026"
     if not row:
-        cur.execute("INSERT INTO settings (key, value) VALUES ('invite_code', 'IR-FAMILY')")
+        cur.execute("INSERT INTO settings (key, value) VALUES ('invite_code', ?)", (default_code,))
+        conn.commit()
+    elif row["value"] == "IR-FAMILY" and portal_config.get("INVITE_CODE"):
+        cur.execute("UPDATE settings SET value = ? WHERE key = 'invite_code'", (portal_config.get("INVITE_CODE"),))
         conn.commit()
 
     # Load or initialize admin from admin_auth.json
@@ -295,7 +309,7 @@ def save_cf_optimizer_state(data: dict) -> bool:
         try:
             cfg = {}
             if os.path.exists(CONFIG_FILE):
-                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                with open(CONFIG_FILE, "r", encoding="utf-8-sig") as f:
                     cfg = json.load(f)
             if "auto_optimize" in data:
                 cfg["CF_AUTO_OPTIMIZE"] = data["auto_optimize"]
@@ -408,7 +422,7 @@ def init_admin_auth() -> dict:
     os.makedirs(BASE_DIR, exist_ok=True)
     if os.path.exists(AUTH_FILE):
         try:
-            with open(AUTH_FILE, "r", encoding="utf-8") as f:
+            with open(AUTH_FILE, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
                 if "username" in data and "password_hash" in data:
                     return data
@@ -437,7 +451,7 @@ def verify_credentials(username: str, password: str) -> bool:
     if not os.path.exists(AUTH_FILE):
         init_admin_auth()
     try:
-        with open(AUTH_FILE, "r", encoding="utf-8") as f:
+        with open(AUTH_FILE, "r", encoding="utf-8-sig") as f:
             data = json.load(f)
         if username.strip() != data.get("username", "admin"):
             return False
@@ -451,7 +465,7 @@ def update_admin_password(old_pwd: str, new_pwd: str) -> tuple[bool, str]:
     if not os.path.exists(AUTH_FILE):
         init_admin_auth()
     try:
-        with open(AUTH_FILE, "r", encoding="utf-8") as f:
+        with open(AUTH_FILE, "r", encoding="utf-8-sig") as f:
             data = json.load(f)
         calc = hash_password(old_pwd, data.get("salt", ""))
         if not secrets.compare_digest(calc, data.get("password_hash", "")) and not (data.get("initial_password") == old_pwd):
@@ -483,7 +497,7 @@ def get_current_credentials_display() -> dict:
     if not os.path.exists(AUTH_FILE):
         init_admin_auth()
     try:
-        with open(AUTH_FILE, "r", encoding="utf-8") as f:
+        with open(AUTH_FILE, "r", encoding="utf-8-sig") as f:
             data = json.load(f)
         return {
             "username": data.get("username", "admin"),
@@ -658,7 +672,7 @@ def load_direct_domains() -> List[str]:
     domains = list(DEFAULT_IRAN_DIRECT_DOMAINS)
     if os.path.exists(DOMAINS_FILE):
         try:
-            with open(DOMAINS_FILE, "r", encoding="utf-8") as f:
+            with open(DOMAINS_FILE, "r", encoding="utf-8-sig") as f:
                 saved = json.load(f)
                 if isinstance(saved, list):
                     for d in saved:
@@ -687,7 +701,7 @@ if not os.path.exists(DOMAINS_FILE):
 def load_telegram_config() -> dict:
     if os.path.exists(TELEGRAM_FILE):
         try:
-            with open(TELEGRAM_FILE, "r", encoding="utf-8") as f:
+            with open(TELEGRAM_FILE, "r", encoding="utf-8-sig") as f:
                 return json.load(f)
         except Exception:
             pass
@@ -1155,14 +1169,52 @@ def stream_reader(proc, name, is_vpn=True):
             tunnel_state["last_sync"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             sync_3xui_with_tunnels()
 
+def ensure_3xui_provisioned():
+    """Auto-provisions 3x-ui admin credentials, API token, and default VLESS inbound."""
+    try:
+        if not os.path.exists(DB_PATH) and os.path.exists(XUI_EXE):
+            subprocess.run([XUI_EXE, "setting", "-username", "admin", "-password", "admin"], cwd=XUI_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        if os.path.exists(DB_PATH):
+            conn = sqlite3.connect(DB_PATH, timeout=5.0)
+            cur = conn.cursor()
+            try:
+                cur.execute("SELECT id FROM api_tokens WHERE token = ?", (API_TOKEN,))
+                if not cur.fetchone():
+                    cur.execute("INSERT OR REPLACE INTO api_tokens (id, name, token, enabled, created_at, scope, expires_at) VALUES (1, 'portal', ?, 1, ?, 'admin', 0)", (API_TOKEN, int(time.time())))
+                    conn.commit()
+            except Exception as e_tok:
+                pass
+
+            try:
+                cur.execute("SELECT id FROM inbounds WHERE port = ?", (VPN_PORT,))
+                if not cur.fetchone():
+                    cur.execute("""
+                        INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing)
+                        VALUES (1, 0, 0, 0, 'Family-VPN-VLESS', 1, 0, '', ?, 'vless', ?, ?, 'inbound-10000', ?)
+                    """, (
+                        VPN_PORT,
+                        json.dumps({"clients": [], "decryption": "none", "fallbacks": []}),
+                        json.dumps({"network": "ws", "security": "none", "wsSettings": {"path": "/vpn-ws", "headers": {"Host": ""}}}),
+                        json.dumps({"enabled": True, "destOverride": ["http", "tls", "quic", "fakedns"]})
+                    ))
+                    conn.commit()
+            except Exception as e_ib:
+                pass
+            conn.close()
+    except Exception as e:
+        print(f"[3x-ui Provision Error] {e}")
+
 def ensure_services():
     # 1. 3x-ui Engine check
     if not is_port_open(XUI_PORT):
         print(f"[Service] Starting 3x-ui engine on port {XUI_PORT}...")
         if os.path.exists(XUI_EXE):
+            ensure_3xui_provisioned()
             p = subprocess.Popen([XUI_EXE, "run"], cwd=XUI_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             tunnel_state["xui_process"] = p
             time.sleep(2)
+            ensure_3xui_provisioned()
 
     # 2. Cloudflare VPN Tunnel (Port VPN_PORT)
     if os.path.exists(CLOUDFLARED_EXE):
@@ -1196,7 +1248,20 @@ def sync_3xui_with_tunnels():
             data = r.json()
             inbounds = data.get("obj", [])
             inbound = next((ib for ib in inbounds if ib.get("port") == VPN_PORT or ib.get("port") == 10000), None)
-            if inbound:
+            if not inbound:
+                new_inbound = {
+                    "up": 0, "down": 0, "total": 0,
+                    "remark": "Family-VPN-VLESS", "enable": True,
+                    "expiryTime": 0, "listen": "", "port": VPN_PORT, "protocol": "vless",
+                    "settings": json.dumps({"clients": [], "decryption": "none", "fallbacks": []}),
+                    "streamSettings": json.dumps({
+                        "network": "ws", "security": "none",
+                        "wsSettings": {"path": "/vpn-ws", "headers": {"Host": vpn_host}}
+                    }),
+                    "sniffing": json.dumps({"enabled": True, "destOverride": ["http", "tls", "quic", "fakedns"]})
+                }
+                s.post(f"{base_url}/panel/api/inbounds/add", json=new_inbound, timeout=4)
+            elif inbound:
                 stream_settings = inbound.get("streamSettings")
                 if isinstance(stream_settings, str):
                     stream_settings = json.loads(stream_settings)

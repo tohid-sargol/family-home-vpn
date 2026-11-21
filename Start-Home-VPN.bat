@@ -37,4 +37,8 @@ if %errorlevel% equ 0 (
 set "PYTHON_EXE=python"
 
 :RunPortal
-"%PYTHON_EXE%" portal.py
+if "%PYTHON_EXE:~0,3%"=="py " (
+    %PYTHON_EXE% portal.py
+) else (
+    "%PYTHON_EXE%" portal.py
+)

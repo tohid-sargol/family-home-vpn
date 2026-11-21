@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Home VPN Platform - Zero-Touch Self-Healing Installer & Diagnostics
 .DESCRIPTION
@@ -116,32 +116,44 @@ Write-DiagLog "Running pre-flight diagnostics and system preparation..." "HEADER
 # ----------------- Runtime Detection: Python ----------------- #
 $pythonExe = $null
 
-# 1. Check path
-$testPython = Get-Command python.exe -ErrorAction SilentlyContinue
-if ($testPython) {
-    $pythonExe = $testPython.Source
+function Test-ValidPython {
+    param([string]$path)
+    if ([string]::IsNullOrWhiteSpace($path)) { return $false }
+    try {
+        $ver = & $path --version 2>&1
+        if ($ver -match "Python 3\.") {
+            return $true
+        }
+    } catch {}
+    return $false
 }
 
-# 2. Check LocalAppData
+# 1. Check LocalAppData
+$localPy = Get-ChildItem -Path "$env:LOCALAPPDATA\Programs\Python\Python3*" -Filter "python.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($localPy -and (Test-ValidPython $localPy.FullName)) {
+    $pythonExe = $localPy.FullName
+}
+
+# 2. Check Program Files
 if (-not $pythonExe) {
-    $localPy = Get-ChildItem -Path "$env:LOCALAPPDATA\Programs\Python\Python3*" -Filter "python.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($localPy) {
-        $pythonExe = $localPy.FullName
+    $progPy = Get-ChildItem -Path "$env:ProgramFiles\Python3*" -Filter "python.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($progPy -and (Test-ValidPython $progPy.FullName)) {
+        $pythonExe = $progPy.FullName
     }
 }
 
-# 3. Check Program Files
+# 3. Check path (excluding WindowsApps shim if invalid)
 if (-not $pythonExe) {
-    $progPy = Get-ChildItem -Path "$env:ProgramFiles\Python3*" -Filter "python.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($progPy) {
-        $pythonExe = $progPy.FullName
+    $testPython = Get-Command python.exe -ErrorAction SilentlyContinue
+    if ($testPython -and (Test-ValidPython $testPython.Source)) {
+        $pythonExe = $testPython.Source
     }
 }
 
 # 4. Check py launcher
 if (-not $pythonExe) {
     $testPy = Get-Command py.exe -ErrorAction SilentlyContinue
-    if ($testPy) {
+    if ($testPy -and (Test-ValidPython "py")) {
         $pythonExe = "py"
     }
 }
@@ -192,6 +204,11 @@ try {
 
 if (-not $dockerRunning) {
     Write-DiagLog "Cleanly activating Standalone Native Runtime (Native Python + bundled Cloudflared + bundled 3x-ui)." "SUCCESS"
+    $xuiExe = Join-Path $ScriptDir "3x-ui\x-ui\3x-ui.exe"
+    if (Test-Path $xuiExe) {
+        & $xuiExe setting -username admin -password admin >$null 2>&1
+        Write-DiagLog "Pre-configured 3x-ui admin credentials." "SUCCESS"
+    }
 }
 
 # ----------------- Port Conflict Scanner & Auto-Remediation ----------------- #

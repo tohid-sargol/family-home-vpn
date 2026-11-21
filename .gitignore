@@ -1,6 +1,8 @@
 # Runtime Databases & Credential configs
 *.db
 *.db-journal
+*.db-shm
+*.db-wal
 *.env
 admin_auth.json
 telegram_config.json
@@ -20,6 +22,8 @@ venv/
 3x-ui/x-ui/log/archive/
 setup-diagnostics.log
 
-# OS generated files
+# OS generated files & Archives
 .DS_Store
 Thumbs.db
+*.zip
+*.gob
