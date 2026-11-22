@@ -159,6 +159,19 @@ def init_portal_db():
     conn = get_db()
     cur = conn.cursor()
     cur.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            token TEXT PRIMARY KEY,
+            user_id INTEGER,
+            name TEXT,
+            username TEXT,
+            email TEXT,
+            role TEXT,
+            sub_id TEXT,
+            uuid TEXT,
+            expires REAL
+        )
+    """)
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
@@ -250,21 +263,37 @@ def record_user_activity(email_or_sub: str, request: Optional[Request] = None, i
     if not client_ip and request:
         client_ip = extract_client_ip(request)
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    target = email_or_sub.lower().strip()
+    is_admin_alias = target in ("admin", "tohid") or "tohid" in target
     try:
         conn = get_db()
         cur = conn.cursor()
-        if client_ip and client_ip not in ("127.0.0.1", "localhost", ""):
-            cur.execute("""
-                UPDATE users 
-                SET last_ip = ?, last_seen = ? 
-                WHERE lower(email) = ? OR sub_id = ? OR uuid = ?
-            """, (client_ip, now_str, email_or_sub.lower(), email_or_sub, email_or_sub))
+        if client_ip and client_ip not in ("127.0.0.1", "localhost", "::1", ""):
+            if is_admin_alias:
+                cur.execute("""
+                    UPDATE users 
+                    SET last_ip = ?, last_seen = ? 
+                    WHERE lower(email) IN ('admin', 'tohid') OR lower(name) LIKE '%tohid%'
+                """, (client_ip, now_str))
+            else:
+                cur.execute("""
+                    UPDATE users 
+                    SET last_ip = ?, last_seen = ? 
+                    WHERE lower(email) = ? OR lower(name) = ? OR sub_id = ? OR uuid = ?
+                """, (client_ip, now_str, target, target, target, target))
         else:
-            cur.execute("""
-                UPDATE users 
-                SET last_seen = ? 
-                WHERE lower(email) = ? OR sub_id = ? OR uuid = ?
-            """, (now_str, email_or_sub.lower(), email_or_sub, email_or_sub))
+            if is_admin_alias:
+                cur.execute("""
+                    UPDATE users 
+                    SET last_seen = ? 
+                    WHERE lower(email) IN ('admin', 'tohid') OR lower(name) LIKE '%tohid%'
+                """, (now_str,))
+            else:
+                cur.execute("""
+                    UPDATE users 
+                    SET last_seen = ? 
+                    WHERE lower(email) = ? OR lower(name) = ? OR sub_id = ? OR uuid = ?
+                """, (now_str, target, target, target, target))
         conn.commit()
         conn.close()
     except Exception as e:
@@ -1139,6 +1168,14 @@ def get_all_users_activity() -> Dict[str, dict]:
             conn_x.close()
         except Exception as e:
             print(f"[3x-ui DB Activity Error] {e}")
+
+    # 3.5 Link admin and tohid so they share active IP
+    admin_act = activity.get("admin")
+    tohid_act = activity.get("tohid")
+    if admin_act and admin_act.get("last_ip") and (not tohid_act or not tohid_act.get("last_ip")):
+        activity["tohid"] = dict(admin_act)
+    elif tohid_act and tohid_act.get("last_ip") and (not admin_act or not admin_act.get("last_ip")):
+        activity["admin"] = dict(tohid_act)
 
     # 4. Read recent lines from access.log
     if os.path.exists(ACCESS_LOG):
@@ -2162,9 +2199,9 @@ def build_farsi_instructions(email: str, sub_url: str) -> str:
 
 def get_session(request: Request) -> Optional[dict]:
     token = request.cookies.get("vpn_session") or request.cookies.get("vpn_admin_session")
-    if token and token in active_sessions:
-        sess = active_sessions[token]
-        if sess.get("expires", 0) > time.time():
+    if token:
+        if token in active_sessions and active_sessions[token].get("expires", 0) > time.time():
+            sess = active_sessions[token]
             if (
                 sess.get("username", "").lower() in ["admin", "tohid"] or
                 sess.get("email", "").lower() in ["admin", "tohid"] or
@@ -2172,10 +2209,31 @@ def get_session(request: Request) -> Optional[dict]:
             ):
                 sess["role"] = "admin"
             return sess
+        try:
+            conn = get_db()
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM sessions WHERE token = ? AND expires > ?", (token, time.time()))
+            row = cur.fetchone()
+            conn.close()
+            if row:
+                sess = dict(row)
+                if (
+                    sess.get("username", "").lower() in ["admin", "tohid"] or
+                    sess.get("email", "").lower() in ["admin", "tohid"] or
+                    "tohid" in (sess.get("name") or "").lower()
+                ):
+                    sess["role"] = "admin"
+                active_sessions[token] = sess
+                return sess
+        except Exception:
+            pass
 
-    # Localhost / local loopback auto-admin fallback
-    client_ip = getattr(request.client, "host", "") if request.client else ""
-    if client_ip in ["127.0.0.1", "::1", "localhost", "testclient"]:
+    # Auto-admin for Tohid's known IP subnet and localhost
+    client_ip = extract_client_ip(request)
+    if (
+        client_ip in ["127.0.0.1", "::1", "localhost", "testclient"] or
+        client_ip.startswith("2a06:5900:562:9400:")
+    ):
         return {
             "user_id": 1,
             "name": "Admin (Tohid)",
@@ -2422,6 +2480,19 @@ async def api_login(request: Request, response: Response):
         "expires": time.time() + (14 * 86400)
     }
 
+    try:
+        conn_s = get_db()
+        cur_s = conn_s.cursor()
+        cur_s.execute("""
+            INSERT OR REPLACE INTO sessions (token, user_id, name, username, email, role, sub_id, uuid, expires)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (token, user["id"], user["name"], user["username"], user["email"], user["role"], user["sub_id"], user["uuid"], time.time() + 14*86400))
+        conn_s.commit()
+        conn_s.close()
+    except Exception as e:
+        print(f"[Session DB Error] {e}")
+
+    is_https = (request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https")
     redirect_url = "/admin" if user["role"] == "admin" else "/dashboard"
     res = JSONResponse({"success": True, "role": user["role"], "redirect": redirect_url})
     res.set_cookie(
@@ -2429,6 +2500,7 @@ async def api_login(request: Request, response: Response):
         value=token,
         max_age=14 * 86400,
         httponly=True,
+        secure=is_https,
         samesite="lax",
         path="/"
     )
@@ -2791,6 +2863,13 @@ def list_clients(request: Request):
     update_tunnel_state_from_request(request)
     detect_tunnel_urls_from_logs()
 
+    session = get_session(request)
+    if session:
+        record_user_activity(session.get("email", "admin"), request)
+        if session.get("role") == "admin" or session.get("username", "").lower() in ["admin", "tohid"]:
+            record_user_activity("admin", request)
+            record_user_activity("tohid", request)
+
     user_bw_map = {}
     db_users = []
     try:
@@ -2803,7 +2882,7 @@ def list_clients(request: Request):
                 user_bw_map[r["email"].lower()] = int(bw)
             if r["uuid"]:
                 user_bw_map[r["uuid"]] = int(bw)
-            if r["email"] and r["role"] != "admin":
+            if r["email"]:
                 db_users.append(dict(r))
         conn_bw.close()
     except Exception as e:
@@ -5611,7 +5690,33 @@ def get_dashboard_page(request: Request):
 
 @app.get("/admin", response_class=HTMLResponse)
 def get_admin_page(request: Request):
-    return HTMLResponse(ADMIN_PAGE_HTML)
+    session = get_session(request)
+    if session:
+        record_user_activity(session.get("email", "admin"), request)
+        if session.get("role") == "admin" or session.get("username", "").lower() in ["admin", "tohid"]:
+            record_user_activity("admin", request)
+            record_user_activity("tohid", request)
+
+    clean_ips = get_active_clean_ips()
+    active_edge_ip = clean_ips[0][0] if clean_ips else "162.159.36.1"
+    opt_state = get_cf_optimizer_state()
+    latency = int(opt_state.get("latency_ms", 63) or 63)
+    portal_host = get_clean_portal_host(request)
+    public_url = f"https://{portal_host}" if (portal_host and not portal_host.startswith("http")) else (portal_host or f"http://127.0.0.1:{PORTAL_PORT}")
+
+    rendered = ADMIN_PAGE_HTML
+    rendered = rendered.replace('<span id="heroTunnelIp" class="text-xl sm:text-2xl font-mono font-extrabold text-white select-all">در حال دریافت...</span>', f'<span id="heroTunnelIp" class="text-xl sm:text-2xl font-mono font-extrabold text-white select-all">{active_edge_ip}</span>')
+    rendered = rendered.replace('<span id="heroTunnelLatency" class="text-indigo-300 font-mono text-[11px]">تاخیر: -- ms</span>', f'<span id="heroTunnelLatency" class="text-indigo-300 font-mono text-[11px]">تاخیر: {latency} ms</span>')
+    rendered = rendered.replace('در حال اتصال تونل...', public_url)
+
+    return HTMLResponse(
+        content=rendered,
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0"
+        }
+    )
 
 @app.get("/help", response_class=HTMLResponse)
 def get_help_page(request: Request):
