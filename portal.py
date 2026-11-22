@@ -27,7 +27,7 @@ import string
 import hashlib
 import gzip
 import shutil
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from urllib.parse import quote
 
 import requests
@@ -181,6 +181,12 @@ def init_portal_db():
         cur.execute("ALTER TABLE users ADD COLUMN bandwidth_limit_mbps INTEGER DEFAULT 10")
         cur.execute("UPDATE users SET bandwidth_limit_mbps = 10 WHERE bandwidth_limit_mbps IS NULL")
         conn.commit()
+    if "last_ip" not in user_cols:
+        cur.execute("ALTER TABLE users ADD COLUMN last_ip TEXT DEFAULT ''")
+        conn.commit()
+    if "last_seen" not in user_cols:
+        cur.execute("ALTER TABLE users ADD COLUMN last_seen TEXT DEFAULT ''")
+        conn.commit()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
@@ -218,6 +224,51 @@ def init_portal_db():
     else:
         # Keep admin credentials in sync
         cur.execute("UPDATE users SET password_hash = ?, salt = ? WHERE id = ?", (admin_hash, admin_salt, admin_row["id"]))
+        conn.commit()
+    conn.close()
+
+def extract_client_ip(request: Request) -> str:
+    cf_ip = request.headers.get("cf-connecting-ip")
+    if cf_ip and cf_ip.strip():
+        return cf_ip.strip()
+    true_ip = request.headers.get("true-client-ip")
+    if true_ip and true_ip.strip():
+        return true_ip.strip()
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        parts = [p.strip() for p in xff.split(",") if p.strip()]
+        if parts:
+            return parts[0]
+    if request.client and request.client.host:
+        return request.client.host
+    return ""
+
+def record_user_activity(email_or_sub: str, request: Optional[Request] = None, ip_override: Optional[str] = None):
+    if not email_or_sub:
+        return
+    client_ip = ip_override
+    if not client_ip and request:
+        client_ip = extract_client_ip(request)
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        if client_ip and client_ip not in ("127.0.0.1", "localhost", ""):
+            cur.execute("""
+                UPDATE users 
+                SET last_ip = ?, last_seen = ? 
+                WHERE lower(email) = ? OR sub_id = ? OR uuid = ?
+            """, (client_ip, now_str, email_or_sub.lower(), email_or_sub, email_or_sub))
+        else:
+            cur.execute("""
+                UPDATE users 
+                SET last_seen = ? 
+                WHERE lower(email) = ? OR sub_id = ? OR uuid = ?
+            """, (now_str, email_or_sub.lower(), email_or_sub, email_or_sub))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[Record Activity Error] {e}")
         conn.commit()
 
     conn.close()
@@ -904,29 +955,53 @@ def ensure_xray_logging():
     try:
         os.makedirs(LOG_DIR, exist_ok=True)
         os.makedirs(ARCHIVE_DIR, exist_ok=True)
-        s, base_url = get_3xui_auth_session()
-        r = s.get(f"{base_url}/panel/api/xray/getDefaultJsonConfig", timeout=4)
-        if r.status_code == 200:
-            template = r.json().get("obj", {})
-            current_log = template.get("log", {})
-            needs_update = (
-                current_log.get("loglevel") != "info" or
+        if os.path.exists(DB_PATH):
+            conn = sqlite3.connect(DB_PATH, timeout=5.0)
+            cur = conn.cursor()
+            cur.execute("SELECT value FROM settings WHERE key = 'xrayTemplateConfig'")
+            row = cur.fetchone()
+            log_dir_fwd = LOG_DIR.replace("\\", "/")
+            access_log_path = f"{log_dir_fwd}/access.log"
+            error_log_path = f"{log_dir_fwd}/error.log"
+
+            tpl = {}
+            if row and row[0]:
+                try:
+                    tpl = json.loads(row[0])
+                except Exception:
+                    tpl = {}
+            if not tpl:
+                try:
+                    s, base_url = get_3xui_auth_session()
+                    r = s.get(f"{base_url}/panel/api/xray/getDefaultJsonConfig", timeout=4)
+                    if r.status_code == 200:
+                        tpl = r.json().get("obj", {})
+                except Exception:
+                    pass
+
+            current_log = tpl.get("log", {}) if isinstance(tpl, dict) else {}
+            if (current_log.get("loglevel") != "info" or
                 not current_log.get("dnsLog") or
-                "access.log" not in current_log.get("access", "")
-            )
-            if needs_update:
-                template["log"] = {
-                    "access": "/var/log/x-ui/access.log",
-                    "error": "/var/log/x-ui/error.log",
+                current_log.get("access") != access_log_path):
+                
+                if not isinstance(tpl, dict):
+                    tpl = {}
+                tpl["log"] = {
+                    "access": access_log_path,
+                    "error": error_log_path,
                     "loglevel": "info",
                     "dnsLog": True,
                     "maskAddress": ""
                 }
-                upd_payload = {"xraySetting": json.dumps(template, indent=2)}
-                r_upd = s.post(f"{base_url}/panel/api/xray/update", data=upd_payload, timeout=5)
-                if r_upd.status_code == 200 and r_upd.json().get("success"):
+                cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('xrayTemplateConfig', ?)", (json.dumps(tpl, indent=2),))
+                conn.commit()
+                try:
+                    s, base_url = get_3xui_auth_session()
                     s.post(f"{base_url}/panel/api/server/restartXrayService", timeout=5)
-                    print("[Xray Config] Successfully configured persistent logging with info loglevel and dnsLog.")
+                    print("[Xray Logging] Updated xrayTemplateConfig in x-ui.db with persistent logging and restarted Xray.")
+                except Exception:
+                    pass
+            conn.close()
     except Exception as e:
         print(f"[Xray Log Config Error] {e}")
 
@@ -955,14 +1030,119 @@ def rotate_logs_if_needed():
 
 # ----------------- User Activity, Connection Status & Failing Domains Inspector ----------------- #
 
+def format_relative_time(diff_sec: float) -> Tuple[str, str]:
+    if diff_sec < 60:
+        return "Just now", "همین الان"
+    elif diff_sec < 3600:
+        mins = max(1, int(diff_sec // 60))
+        return f"{mins} mins ago", f"{mins} دقیقه پیش"
+    elif diff_sec < 86400:
+        hrs = int(diff_sec // 3600)
+        return f"{hrs} hrs ago", f"{hrs} ساعت پیش"
+    else:
+        days = int(diff_sec // 86400)
+        return f"{days} days ago", f"{days} روز پیش"
+
 def get_all_users_activity() -> Dict[str, dict]:
-    """Scans recent access.log lines and computes live online status (last 15m) and last seen timestamp."""
-    activity = {}
+    """
+    Computes live online status, last seen timestamp, and last connected IP
+    by combining portal.db, 3x-ui.db client_traffics, inbound_client_ips, and access.log.
+    """
+    activity: Dict[str, dict] = {}
     now = datetime.datetime.now()
+
+    # 1. Read from portal.db (last_ip, last_seen)
+    try:
+        conn_p = get_db()
+        cur_p = conn_p.cursor()
+        cur_p.execute("SELECT email, sub_id, uuid, last_ip, last_seen FROM users")
+        for r in cur_p.fetchall():
+            email = (r["email"] or "").lower()
+            if not email:
+                continue
+            last_seen_val = r["last_seen"]
+            last_ip_val = r["last_ip"] or ""
+            act_entry = {
+                "last_seen_str": last_seen_val or "",
+                "last_seen_en": "Never",
+                "last_seen_fa": "تاکنون متصل نشده",
+                "is_online": False,
+                "last_ip": last_ip_val,
+                "latest_dt": None
+            }
+            if last_seen_val:
+                try:
+                    dt = datetime.datetime.strptime(last_seen_val, "%Y-%m-%d %H:%M:%S")
+                    diff_sec = (now - dt).total_seconds()
+                    act_entry["latest_dt"] = dt
+                    act_entry["is_online"] = (diff_sec >= -60 and diff_sec < 900)
+                    en_str, fa_str = format_relative_time(diff_sec)
+                    act_entry["last_seen_en"] = en_str
+                    act_entry["last_seen_fa"] = fa_str
+                except Exception:
+                    pass
+            activity[email] = act_entry
+            if r["sub_id"]:
+                activity[r["sub_id"]] = act_entry
+            if r["uuid"]:
+                activity[r["uuid"]] = act_entry
+        conn_p.close()
+    except Exception as e:
+        print(f"[Portal DB Activity Error] {e}")
+
+    # 2. Read from 3x-ui.db (client_traffics: last_online)
+    if os.path.exists(DB_PATH):
+        try:
+            conn_x = sqlite3.connect(DB_PATH, timeout=5.0)
+            cur_x = conn_x.cursor()
+            try:
+                cur_x.execute("SELECT email, last_online FROM client_traffics WHERE last_online > 0")
+                for email_raw, last_online_ms in cur_x.fetchall():
+                    if not email_raw:
+                        continue
+                    email_key = email_raw.lower()
+                    dt = datetime.datetime.fromtimestamp(last_online_ms / 1000.0)
+                    diff_sec = (now - dt).total_seconds()
+                    is_online = (diff_sec >= -60 and diff_sec < 900)
+                    en_str, fa_str = format_relative_time(diff_sec)
+
+                    if email_key not in activity or not activity[email_key].get("latest_dt") or dt > activity[email_key]["latest_dt"]:
+                        prev_ip = activity.get(email_key, {}).get("last_ip", "")
+                        activity[email_key] = {
+                            "last_seen_str": dt.strftime("%Y-%m-%d %H:%M:%S"),
+                            "last_seen_en": en_str,
+                            "last_seen_fa": fa_str,
+                            "is_online": is_online,
+                            "last_ip": prev_ip,
+                            "latest_dt": dt
+                        }
+                    else:
+                        if is_online:
+                            activity[email_key]["is_online"] = True
+            except Exception:
+                pass
+
+            # 3. Read client IPs from inbound_client_ips in 3x-ui.db if present
+            try:
+                cur_x.execute("SELECT client_email, ips FROM inbound_client_ips WHERE ips IS NOT NULL AND ips != ''")
+                for c_email, ips in cur_x.fetchall():
+                    if c_email and ips:
+                        ek = c_email.lower()
+                        clean_ip = ips.split(",")[0].strip()
+                        if clean_ip and ek in activity and not activity[ek].get("last_ip"):
+                            activity[ek]["last_ip"] = clean_ip
+            except Exception:
+                pass
+
+            conn_x.close()
+        except Exception as e:
+            print(f"[3x-ui DB Activity Error] {e}")
+
+    # 4. Read recent lines from access.log
     if os.path.exists(ACCESS_LOG):
         try:
             with open(ACCESS_LOG, "r", encoding="utf-8", errors="ignore") as f:
-                lines = f.readlines()[-8000:]
+                lines = f.readlines()[-4000:]
             for line in reversed(lines):
                 line_str = line.strip()
                 if not line_str:
@@ -970,43 +1150,31 @@ def get_all_users_activity() -> Dict[str, dict]:
                 m_email = re.search(r"email:\s*([^\s]+)", line_str)
                 if not m_email:
                     continue
-                email = m_email.group(1).strip()
-                if email in activity:
-                    continue
-
+                email = m_email.group(1).strip().lower()
                 m_time = re.match(r"^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})", line_str)
                 if m_time:
                     try:
                         dt = datetime.datetime.strptime(m_time.group(1), "%Y/%m/%d %H:%M:%S")
                         diff_sec = (now - dt).total_seconds()
                         is_online = (diff_sec >= -60 and diff_sec < 900)
-
-                        if diff_sec < 60:
-                            rel_en = "Just now"
-                            rel_fa = "همین الان"
-                        elif diff_sec < 3600:
-                            mins = max(1, int(diff_sec // 60))
-                            rel_en = f"{mins} mins ago"
-                            rel_fa = f"{mins} دقیقه پیش"
-                        elif diff_sec < 86400:
-                            hrs = int(diff_sec // 3600)
-                            rel_en = f"{hrs} hrs ago"
-                            rel_fa = f"{hrs} ساعت پیش"
-                        else:
-                            days = int(diff_sec // 86400)
-                            rel_en = f"{days} days ago"
-                            rel_fa = f"{days} روز پیش"
-
-                        activity[email] = {
-                            "last_seen_str": m_time.group(1),
-                            "last_seen_en": rel_en,
-                            "last_seen_fa": rel_fa,
-                            "is_online": is_online
-                        }
+                        en_str, fa_str = format_relative_time(diff_sec)
+                        if email not in activity or not activity[email].get("latest_dt") or dt > activity[email]["latest_dt"]:
+                            prev_ip = activity.get(email, {}).get("last_ip", "")
+                            activity[email] = {
+                                "last_seen_str": dt.strftime("%Y-%m-%d %H:%M:%S"),
+                                "last_seen_en": en_str,
+                                "last_seen_fa": fa_str,
+                                "is_online": is_online,
+                                "last_ip": prev_ip,
+                                "latest_dt": dt
+                            }
+                        elif is_online:
+                            activity[email]["is_online"] = True
                     except Exception:
                         pass
-        except Exception as e:
-            print(f"[Activity Parse Error] {e}")
+        except Exception:
+            pass
+
     return activity
 
 def get_failing_and_leaked_domains(limit: int = 100) -> List[dict]:
@@ -2066,6 +2234,8 @@ def get_singbox_subscription(sub_id: str, request: Request):
         else:
             raise HTTPException(status_code=404, detail="Subscription not found")
 
+    record_user_activity(target.get("email"), request)
+
     vpn_host = get_clean_vpn_host()
     sub_host = get_clean_portal_host(request) or "127.0.0.1"
     profile = build_resilient_singbox_profile(target.get("id"), target.get("email", "VPN"), vpn_host, sub_host)
@@ -2103,6 +2273,8 @@ def get_vless_subscription(sub_id: str, request: Request):
             target = {"id": u_row["uuid"], "email": u_row["email"], "subId": u_row["sub_id"], "up": 0, "down": 0, "totalGB": 0}
         else:
             raise HTTPException(status_code=404, detail="Subscription not found")
+
+    record_user_activity(target.get("email"), request)
 
     vpn_host = get_clean_vpn_host()
     uris = build_resilient_vless_links(target.get("id"), target.get("email", "VPN"), vpn_host)
@@ -2206,6 +2378,8 @@ async def api_login(request: Request, response: Response):
     if not user:
         raise HTTPException(status_code=401, detail="Invalid username or password / نام کاربری یا رمز عبور اشتباه است")
 
+    record_user_activity(user["email"], request)
+
     token = secrets.token_urlsafe(32)
     active_sessions[token] = {
         "user_id": user["id"],
@@ -2267,6 +2441,8 @@ def api_get_my_info(request: Request):
     sub_id = session.get("sub_id", "")
     client_uuid = session.get("uuid", "")
     user_name = session.get("name", email)
+
+    record_user_activity(email, request)
 
     # Fetch fresh client stats from 3x-ui
     ib = get_inbound_and_clients()
@@ -2671,10 +2847,11 @@ def list_clients(request: Request):
         elif limit_bytes > 0 and total_used >= limit_bytes:
             status = "Over Quota"
 
-        act = activity_map.get(email, {})
+        act = activity_map.get(email.lower()) or activity_map.get(client_uuid) or activity_map.get(sub_id) or {}
         is_online = act.get("is_online", False)
         last_seen_en = act.get("last_seen_en", "Never")
-        last_seen_fa = act.get("last_seen_fa", "تاکنون")
+        last_seen_fa = act.get("last_seen_fa", "تاکنون متصل نشده")
+        last_ip = act.get("last_ip") or "---"
 
         sub_id = c.get("subId", email)
         client_uuid = c.get("id")
@@ -2708,6 +2885,7 @@ def list_clients(request: Request):
             "is_online": is_online,
             "last_seen_en": last_seen_en,
             "last_seen_fa": last_seen_fa,
+            "last_ip": last_ip,
             "enable": c.get("enable", True),
             "smart_sub_link": smart_sub_link,
             "json_sub_link": json_sub_link,
@@ -4555,7 +4733,14 @@ ADMIN_PAGE_HTML = """<!DOCTYPE html>
           <tr class="hover:bg-white/[0.02] transition">
             <td class="p-3.5 text-start">
               <div class="font-bold text-white text-xs">${c.email}</div>
-              <div class="text-[10px] text-slate-500 font-mono">${(c.id || '').substring(0, 8)}...</div>
+              <div class="text-[10px] text-slate-400 font-mono mt-1 flex items-center gap-1.5 flex-wrap">
+                <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-indigo-500/10 text-indigo-300 border border-indigo-500/20 text-[10px]">
+                  <span>${currentLang === 'fa' ? 'آیپی:' : 'IP:'}</span>
+                  <span class="font-semibold select-all">${c.last_ip && c.last_ip !== '---' ? c.last_ip : '---'}</span>
+                </span>
+                <span class="text-slate-500">•</span>
+                <span class="text-slate-400 text-[10px]">${currentLang === 'fa' ? (c.last_seen_fa || 'تاکنون متصل نشده') : (c.last_seen_en || 'Never connected')}</span>
+              </div>
             </td>
             <td class="p-3.5 text-center">
               <div>${onlineDot}</div>
@@ -5281,10 +5466,20 @@ HELP_PAGE_HTML = """<!DOCTYPE html>
 
 @app.get("/", response_class=HTMLResponse)
 def get_landing_page(request: Request):
+    session = get_session(request)
+    if session:
+        if session.get("role") == "admin":
+            return RedirectResponse("/admin", status_code=303)
+        return RedirectResponse("/dashboard", status_code=303)
     return HTMLResponse(LANDING_PAGE_HTML)
 
 @app.get("/login", response_class=HTMLResponse)
 def get_login_page(request: Request):
+    session = get_session(request)
+    if session:
+        if session.get("role") == "admin":
+            return RedirectResponse("/admin", status_code=303)
+        return RedirectResponse("/dashboard", status_code=303)
     return HTMLResponse(LANDING_PAGE_HTML)
 
 @app.get("/dashboard", response_class=HTMLResponse)
