@@ -106,6 +106,15 @@ chmod +x setup.sh
 - **Restarting Manually**: Run `Start-Home-VPN.bat` or `Start-Home-VPN.vbs` (runs hidden in the background).
 - **Stopping Services**: Terminate the background Python and `3x-ui.exe` processes from Task Manager.
 - **Diagnostics Log**: All installation and runtime checks are written to `setup-diagnostics.log`.
+- **Telegram Alerts Configuration**: If skipped during setup or updating credentials, add your Bot Token and Chat ID directly in the Admin Portal under Settings, or create `telegram_config.json`:
+  ```json
+  {
+    "enabled": true,
+    "bot_token": "YOUR_BOT_TOKEN",
+    "chat_id": "YOUR_CHAT_ID"
+  }
+  ```
+  *(The system will also read `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` from `config.json` or `.env` automatically).*
 - **Knowledge Base**: Visit `http://127.0.0.1:8080/help` anytime for detailed diagrams and troubleshooting guides.
 
 ---

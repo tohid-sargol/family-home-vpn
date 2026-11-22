@@ -9,10 +9,6 @@ telegram_config.json
 config.json
 !config.json.template
 
-# Local verification & test scripts
-verify_e2e.py
-portal.py.bak
-
 # Python cache & virtual environments
 __pycache__/
 *.py[cod]
@@ -30,4 +26,3 @@ setup-diagnostics.log
 .DS_Store
 Thumbs.db
 *.zip
-*.gob

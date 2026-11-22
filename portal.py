@@ -710,18 +710,78 @@ if not os.path.exists(DOMAINS_FILE):
 
 # ----------------- Telegram Bot Alerting ----------------- #
 
+_telegram_warned = False
+
 def load_telegram_config() -> dict:
+    global _telegram_warned
+    cfg = {"enabled": False, "bot_token": "", "chat_id": ""}
+    
+    # 1. telegram_config.json
     if os.path.exists(TELEGRAM_FILE):
         try:
             with open(TELEGRAM_FILE, "r", encoding="utf-8-sig") as f:
-                return json.load(f)
+                loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    cfg.update(loaded)
         except Exception:
             pass
-    return {"enabled": False, "bot_token": "", "chat_id": ""}
+
+    # 2. Fallback to config.json
+    if not cfg.get("bot_token") or not cfg.get("chat_id"):
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, "r", encoding="utf-8-sig") as f:
+                    c = json.load(f)
+                    if not cfg.get("bot_token"):
+                        cfg["bot_token"] = c.get("TELEGRAM_BOT_TOKEN") or c.get("telegram_bot_token") or ""
+                    if not cfg.get("chat_id"):
+                        cfg["chat_id"] = str(c.get("TELEGRAM_CHAT_ID") or c.get("telegram_chat_id") or "")
+                    if "TELEGRAM_ENABLED" in c:
+                        cfg["enabled"] = bool(c.get("TELEGRAM_ENABLED"))
+            except Exception:
+                pass
+
+    # 3. Fallback to environment variables / .env
+    if not cfg.get("bot_token"):
+        cfg["bot_token"] = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if not cfg.get("chat_id"):
+        cfg["chat_id"] = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    if not cfg.get("enabled") and (os.environ.get("TELEGRAM_ENABLED", "").lower() in ("true", "1", "yes")):
+        cfg["enabled"] = True
+
+    token = cfg.get("bot_token", "").strip()
+    chat_id = cfg.get("chat_id", "").strip()
+    if not token or not chat_id:
+        if not _telegram_warned:
+            print("[Telegram Alert] Bot token or Chat ID is not configured. Telegram alerts are disabled. Configure in telegram_config.json or Admin Portal.")
+            _telegram_warned = True
+    else:
+        if "enabled" not in cfg:
+            cfg["enabled"] = True
+
+    return cfg
 
 def save_telegram_config(cfg: dict):
-    with open(TELEGRAM_FILE, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
+    try:
+        with open(TELEGRAM_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception as e:
+        print(f"[Telegram Save Error] {e}")
+
+    # Also sync to config.json if it exists
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8-sig") as f:
+                c = json.load(f)
+            c["TELEGRAM_ENABLED"] = cfg.get("enabled", False)
+            if "bot_token" in cfg:
+                c["TELEGRAM_BOT_TOKEN"] = cfg.get("bot_token", "")
+            if "chat_id" in cfg:
+                c["TELEGRAM_CHAT_ID"] = cfg.get("chat_id", "")
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(c, f, indent=2)
+        except Exception:
+            pass
 
 def send_telegram_alert_async(message: str):
     def _send():
@@ -1261,13 +1321,41 @@ def get_clean_portal_host(request: Optional[Request] = None) -> str:
         return ""
     return h
 
+cf_tunnel_backoff_until = 0
+
+def kill_orphan_cloudflared(exclude_pids=None):
+    if exclude_pids is None:
+        exclude_pids = set()
+    try:
+        if os.name == "nt":
+            output = subprocess.check_output(
+                ["tasklist", "/fi", "imagename eq cloudflared.exe", "/fo", "csv", "/nh"],
+                text=True, stderr=subprocess.DEVNULL
+            )
+            for row in output.strip().splitlines():
+                parts = [p.strip(' "') for p in row.split(",")]
+                if len(parts) >= 2 and parts[1].isdigit():
+                    pid = int(parts[1])
+                    if pid not in exclude_pids:
+                        print(f"[Cleanup] Terminating orphan cloudflared PID {pid}...")
+                        subprocess.run(["taskkill", "/f", "/pid", str(pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
 def stream_reader(proc, name, is_vpn=True):
+    global cf_tunnel_backoff_until
     try:
         while True:
             line_bytes = proc.stderr.readline()
             if not line_bytes:
                 break
             line = decode_proc_bytes(line_bytes)
+
+            if "status 429" in line or "quick tunnel provisioning failed" in line:
+                print(f"[TUNNEL] Rate limit (429) detected on {name}. Cooling down for 120s: {line.strip()}")
+                cf_tunnel_backoff_until = time.time() + 120
+                tunnel_state[f"{name}_error"] = "Cloudflare quick tunnel rate limited (HTTP 429). Cooling down."
+
             m = re.search(r"https://([a-zA-Z0-9-]+\.trycloudflare\.com)", line)
             if m:
                 host = m.group(1)
@@ -1276,6 +1364,7 @@ def stream_reader(proc, name, is_vpn=True):
                     old_host = tunnel_state.get("vpn_host")
                     tunnel_state["vpn_url"] = url
                     tunnel_state["vpn_host"] = host
+                    tunnel_state.pop("vpn_error", None)
                     print(f"[TUNNEL] VPN Tunnel Active: {url}")
                     if old_host and old_host != host:
                         send_telegram_alert_async(f"🚨 <b>Home VPN Tunnel Updated!</b>\nNew VPN Server: <code>{host}</code>\nSubscription links auto-updated.")
@@ -1285,6 +1374,7 @@ def stream_reader(proc, name, is_vpn=True):
                     tunnel_state["sub_host"] = host
                     tunnel_state["portal_url"] = url
                     tunnel_state["portal_host"] = host
+                    tunnel_state.pop("sub_error", None)
                     print(f"[TUNNEL] Admin Portal & Sub Tunnel Active: {url}")
                     if old_sub and old_sub != host:
                         send_telegram_alert_async(f"🌐 <b>Family VPN Portal Updated!</b>\nNew Remote URL: {url}")
@@ -1331,6 +1421,7 @@ def ensure_3xui_provisioned():
         print(f"[3x-ui Provision Error] {e}")
 
 def ensure_services():
+    global cf_tunnel_backoff_until
     # 0. Scan logs for tunnel URLs
     detect_tunnel_urls_from_logs()
 
@@ -1344,8 +1435,25 @@ def ensure_services():
             time.sleep(2)
             ensure_3xui_provisioned()
 
-    # 2. Cloudflare VPN Tunnel (Port VPN_PORT)
+    # 2. Check Cloudflare Tunnel backoff cooldown
+    now = time.time()
+    if now < cf_tunnel_backoff_until:
+        return
+
+    tracked_pids = set()
+    vpn_p = tunnel_state.get("vpn_process")
+    if vpn_p and vpn_p.poll() is None:
+        tracked_pids.add(vpn_p.pid)
+    sub_p = tunnel_state.get("sub_process")
+    if sub_p and sub_p.poll() is None:
+        tracked_pids.add(sub_p.pid)
+
     if os.path.exists(CLOUDFLARED_EXE):
+        # Terminate orphan cloudflared if either process needs restart
+        if (not vpn_p or vpn_p.poll() is not None) or (not sub_p or sub_p.poll() is not None):
+            kill_orphan_cloudflared(exclude_pids=tracked_pids)
+
+        # Cloudflare VPN Tunnel (Port VPN_PORT)
         if not tunnel_state.get("vpn_process") or tunnel_state["vpn_process"].poll() is not None:
             print(f"[Service] Launching Cloudflare VPN Tunnel (port {VPN_PORT}) with HTTP/2 protocol...")
             p_vpn = subprocess.Popen(
@@ -1355,7 +1463,7 @@ def ensure_services():
             tunnel_state["vpn_process"] = p_vpn
             threading.Thread(target=stream_reader, args=(p_vpn, "cf-vpn", True), daemon=True).start()
 
-        # 3. Cloudflare Admin Portal & Subscription Tunnel (Port PORTAL_PORT)
+        # Cloudflare Admin Portal & Subscription Tunnel (Port PORTAL_PORT)
         if not tunnel_state.get("sub_process") or tunnel_state["sub_process"].poll() is not None:
             print(f"[Service] Launching Cloudflare Admin Portal & Sub Tunnel (port {PORTAL_PORT}) with HTTP/2 protocol...")
             p_sub = subprocess.Popen(
@@ -2861,6 +2969,57 @@ def api_test_telegram():
         if r.status_code == 200:
             return {"success": True, "message": "Test alert sent to Telegram successfully"}
         return {"success": False, "detail": r.text}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+class DetectChatIdReq(BaseModel):
+    bot_token: Optional[str] = None
+
+@app.post("/api/telegram/detect-chat-id")
+def api_detect_chat_id(req: Optional[DetectChatIdReq] = None):
+    cfg = load_telegram_config()
+    token = ""
+    if req and req.bot_token and req.bot_token.strip():
+        token = req.bot_token.strip()
+    if not token:
+        token = cfg.get("bot_token", "").strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="Telegram Bot Token is required to detect Chat ID.")
+    try:
+        url = f"https://api.telegram.org/bot{token}/getUpdates"
+        r = requests.get(url, timeout=8)
+        if r.status_code != 200:
+            raise HTTPException(status_code=400, detail=f"Telegram API error: {r.text}")
+        data = r.json()
+        results = data.get("result", [])
+        if not results:
+            return {
+                "success": False,
+                "message": "No incoming messages found. Please open your bot in Telegram, send /start, and try again."
+            }
+        latest_chat_id = None
+        user_name = None
+        for item in reversed(results):
+            msg = item.get("message") or item.get("edited_message") or item.get("channel_post") or item.get("my_chat_member")
+            if msg and "chat" in msg and "id" in msg["chat"]:
+                latest_chat_id = str(msg["chat"]["id"])
+                user_name = msg["chat"].get("username") or msg["chat"].get("first_name")
+                break
+        if not latest_chat_id:
+            return {"success": False, "message": "Could not extract Chat ID from bot updates."}
+        
+        cfg["chat_id"] = latest_chat_id
+        cfg["bot_token"] = token
+        cfg["enabled"] = True
+        save_telegram_config(cfg)
+        return {
+            "success": True,
+            "chat_id": latest_chat_id,
+            "username": user_name,
+            "message": f"Successfully detected Chat ID {latest_chat_id} and saved configuration!"
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

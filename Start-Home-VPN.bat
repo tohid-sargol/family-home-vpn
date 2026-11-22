@@ -37,6 +37,11 @@ if %errorlevel% equ 0 (
 set "PYTHON_EXE=python"
 
 :RunPortal
+:: Free port 8080 if an orphaned or hung process is holding it
+for /f "tokens=5" %%a in ('netstat -aon ^| findstr ":8080" ^| findstr "LISTENING"') do (
+    taskkill /f /pid %%a >nul 2>nul
+)
+
 if "%PYTHON_EXE:~0,3%"=="py " (
     %PYTHON_EXE% portal.py
 ) else (
