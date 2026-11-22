@@ -781,7 +781,7 @@ def get_3xui_auth_session() -> tuple[requests.Session, str]:
     s = requests.Session()
     csrf_token = ""
     try:
-        r_csrf = s.get(f"{base_url}/csrf-token", timeout=4)
+        r_csrf = s.get(f"{base_url}/csrf-token", timeout=2.0)
         if r_csrf.status_code == 200:
             data = r_csrf.json()
             csrf_token = data.get("obj") or data.get("token") or ""
@@ -800,7 +800,7 @@ def get_3xui_auth_session() -> tuple[requests.Session, str]:
         login_headers["X-CSRF-Token"] = csrf_token
 
     try:
-        r_login = s.post(f"{base_url}/login", data=login_payload, headers=login_headers, timeout=4)
+        r_login = s.post(f"{base_url}/login", data=login_payload, headers=login_headers, timeout=2.0)
         if r_login.status_code != 200 or not r_login.json().get("success"):
             print(f"[3x-ui Auth Notice] status={r_login.status_code}, text={r_login.text}")
     except Exception as e:
@@ -818,9 +818,13 @@ def get_3xui_auth_session() -> tuple[requests.Session, str]:
 
 def get_inbound_and_clients(session=None, base_url=None):
     if session is None or base_url is None:
-        session, base_url = get_3xui_auth_session()
+        try:
+            session, base_url = get_3xui_auth_session()
+        except Exception as e:
+            print(f"[3x-ui Session Init Error] {e}")
+            return None
     try:
-        r = session.get(f"{base_url}/panel/api/inbounds/list", timeout=4)
+        r = session.get(f"{base_url}/panel/api/inbounds/list", timeout=2.0)
         if r.status_code == 200:
             inbounds = r.json().get("obj", [])
             for ib in inbounds:
@@ -1153,33 +1157,142 @@ def is_port_open(port: int, host="127.0.0.1") -> bool:
     except Exception:
         return False
 
-def stream_reader(proc, name, is_vpn=True):
-    for line in iter(proc.stderr.readline, ''):
-        if not line:
-            break
-        m = re.search(r"https://([a-zA-Z0-9-]+\.trycloudflare\.com)", line)
-        if m:
-            host = m.group(1)
-            url = f"https://{host}"
-            if is_vpn:
-                old_host = tunnel_state.get("vpn_host")
-                tunnel_state["vpn_url"] = url
-                tunnel_state["vpn_host"] = host
-                print(f"[TUNNEL] VPN Tunnel Active: {url}")
-                if old_host and old_host != host:
-                    send_telegram_alert_async(f"🚨 <b>Home VPN Tunnel Updated!</b>\nNew VPN Server: <code>{host}</code>\nSubscription links auto-updated.")
-            else:
-                old_sub = tunnel_state.get("portal_host")
-                tunnel_state["sub_url"] = url
-                tunnel_state["sub_host"] = host
-                tunnel_state["portal_url"] = url
-                tunnel_state["portal_host"] = host
-                print(f"[TUNNEL] Admin Portal & Sub Tunnel Active: {url}")
-                if old_sub and old_sub != host:
-                    send_telegram_alert_async(f"🌐 <b>Family VPN Portal Updated!</b>\nNew Remote URL: {url}")
+def decode_proc_bytes(line_bytes: bytes) -> str:
+    """Safely decodes raw bytes from process streams handling UTF-8, UTF-8-BOM, UTF-16, and ANSI."""
+    if not line_bytes:
+        return ""
+    for enc in ("utf-8-sig", "utf-8", "utf-16", "cp1252", "latin-1"):
+        try:
+            return line_bytes.decode(enc)
+        except Exception:
+            continue
+    return line_bytes.decode("utf-8", errors="replace")
 
+def detect_tunnel_urls_from_logs():
+    """Scans portal.log and setup-diagnostics.log for the latest trycloudflare.com URLs."""
+    candidates = [
+        os.path.join(BASE_DIR, "portal.log"),
+        os.path.join(BASE_DIR, "setup-diagnostics.log"),
+    ]
+    for path in candidates:
+        if not os.path.exists(path):
+            continue
+        try:
+            content = ""
+            for enc in ("utf-8-sig", "utf-8", "utf-16", "cp1252", "latin-1"):
+                try:
+                    with open(path, "r", encoding=enc, errors="ignore") as f:
+                        content = f.read()
+                    if content:
+                        break
+                except Exception:
+                    continue
+            if not content:
+                continue
+
+            lines = content.splitlines()
+            for line in reversed(lines):
+                if not tunnel_state.get("portal_host"):
+                    m_portal = re.search(r"(?:Admin Portal & Sub Tunnel Active:\s*|portal.*?)https://([a-zA-Z0-9-]+\.trycloudflare\.com)", line, re.I)
+                    if m_portal:
+                        host = m_portal.group(1)
+                        tunnel_state["portal_host"] = host
+                        tunnel_state["portal_url"] = f"https://{host}"
+                        tunnel_state["sub_host"] = host
+                        tunnel_state["sub_url"] = f"https://{host}"
+                if not tunnel_state.get("vpn_host"):
+                    m_vpn = re.search(r"(?:VPN Tunnel Active:\s*|vpn.*?)https://([a-zA-Z0-9-]+\.trycloudflare\.com)", line, re.I)
+                    if m_vpn:
+                        host = m_vpn.group(1)
+                        tunnel_state["vpn_host"] = host
+                        tunnel_state["vpn_url"] = f"https://{host}"
+
+                if tunnel_state.get("portal_host") and tunnel_state.get("vpn_host"):
+                    break
+
+            # Fallback scan for any trycloudflare URLs if still missing
+            if not tunnel_state.get("portal_host") or not tunnel_state.get("vpn_host"):
+                all_urls = re.findall(r"https://([a-zA-Z0-9-]+\.trycloudflare\.com)", content)
+                for host in reversed(all_urls):
+                    if not tunnel_state.get("portal_host"):
+                        tunnel_state["portal_host"] = host
+                        tunnel_state["portal_url"] = f"https://{host}"
+                        tunnel_state["sub_host"] = host
+                        tunnel_state["sub_url"] = f"https://{host}"
+                    elif not tunnel_state.get("vpn_host") and host != tunnel_state.get("portal_host"):
+                        tunnel_state["vpn_host"] = host
+                        tunnel_state["vpn_url"] = f"https://{host}"
+        except Exception as e:
+            print(f"[Detect Logs Error] {path}: {e}")
+
+def update_tunnel_state_from_request(request: Optional[Request]):
+    """Captures and sets trycloudflare.com hostname from incoming HTTP Host/X-Forwarded-Host header."""
+    if not request:
+        return
+    try:
+        raw_host = request.headers.get("x-forwarded-host") or request.headers.get("host", "")
+        host = raw_host.split(":")[0].strip()
+        if re.match(r"^[a-zA-Z0-9-]+\.trycloudflare\.com$", host, re.I):
+            tunnel_state["portal_host"] = host
+            tunnel_state["portal_url"] = f"https://{host}"
+            tunnel_state["sub_host"] = host
+            tunnel_state["sub_url"] = f"https://{host}"
             tunnel_state["last_sync"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            sync_3xui_with_tunnels()
+    except Exception:
+        pass
+
+def get_clean_vpn_host() -> str:
+    h = tunnel_state.get("vpn_host", "")
+    if not h or h in ("Pending...", "Unknown", "127.0.0.1", "Initializing..."):
+        detect_tunnel_urls_from_logs()
+        h = tunnel_state.get("vpn_host", "")
+    if not h or h in ("Pending...", "Unknown", "127.0.0.1", "Initializing..."):
+        return "127.0.0.1"
+    return h
+
+def get_clean_portal_host(request: Optional[Request] = None) -> str:
+    if request:
+        update_tunnel_state_from_request(request)
+    h = tunnel_state.get("portal_host", "")
+    if not h or h in ("Pending...", "Unknown", "127.0.0.1", "Initializing..."):
+        detect_tunnel_urls_from_logs()
+        h = tunnel_state.get("portal_host", "")
+    if not h or h in ("Pending...", "Unknown", "127.0.0.1", "Initializing..."):
+        return ""
+    return h
+
+def stream_reader(proc, name, is_vpn=True):
+    try:
+        while True:
+            line_bytes = proc.stderr.readline()
+            if not line_bytes:
+                break
+            line = decode_proc_bytes(line_bytes)
+            m = re.search(r"https://([a-zA-Z0-9-]+\.trycloudflare\.com)", line)
+            if m:
+                host = m.group(1)
+                url = f"https://{host}"
+                if is_vpn:
+                    old_host = tunnel_state.get("vpn_host")
+                    tunnel_state["vpn_url"] = url
+                    tunnel_state["vpn_host"] = host
+                    print(f"[TUNNEL] VPN Tunnel Active: {url}")
+                    if old_host and old_host != host:
+                        send_telegram_alert_async(f"🚨 <b>Home VPN Tunnel Updated!</b>\nNew VPN Server: <code>{host}</code>\nSubscription links auto-updated.")
+                else:
+                    old_sub = tunnel_state.get("portal_host")
+                    tunnel_state["sub_url"] = url
+                    tunnel_state["sub_host"] = host
+                    tunnel_state["portal_url"] = url
+                    tunnel_state["portal_host"] = host
+                    print(f"[TUNNEL] Admin Portal & Sub Tunnel Active: {url}")
+                    if old_sub and old_sub != host:
+                        send_telegram_alert_async(f"🌐 <b>Family VPN Portal Updated!</b>\nNew Remote URL: {url}")
+
+                tunnel_state["last_sync"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                sync_3xui_with_tunnels()
+    except Exception as e:
+        print(f"[Stream Reader Error] {name}: {e}")
 
 def ensure_3xui_provisioned():
     """Auto-provisions 3x-ui admin credentials, API token, and default VLESS inbound."""
@@ -1218,6 +1331,9 @@ def ensure_3xui_provisioned():
         print(f"[3x-ui Provision Error] {e}")
 
 def ensure_services():
+    # 0. Scan logs for tunnel URLs
+    detect_tunnel_urls_from_logs()
+
     # 1. 3x-ui Engine check
     if not is_port_open(XUI_PORT):
         print(f"[Service] Starting 3x-ui engine on port {XUI_PORT}...")
@@ -1234,7 +1350,7 @@ def ensure_services():
             print(f"[Service] Launching Cloudflare VPN Tunnel (port {VPN_PORT}) with HTTP/2 protocol...")
             p_vpn = subprocess.Popen(
                 [CLOUDFLARED_EXE, "tunnel", "--protocol", "http2", "--no-autoupdate", "--url", f"http://127.0.0.1:{VPN_PORT}"],
-                stderr=subprocess.PIPE, text=True, bufsize=1
+                stderr=subprocess.PIPE, bufsize=0
             )
             tunnel_state["vpn_process"] = p_vpn
             threading.Thread(target=stream_reader, args=(p_vpn, "cf-vpn", True), daemon=True).start()
@@ -1244,7 +1360,7 @@ def ensure_services():
             print(f"[Service] Launching Cloudflare Admin Portal & Sub Tunnel (port {PORTAL_PORT}) with HTTP/2 protocol...")
             p_sub = subprocess.Popen(
                 [CLOUDFLARED_EXE, "tunnel", "--protocol", "http2", "--no-autoupdate", "--url", f"http://127.0.0.1:{PORTAL_PORT}"],
-                stderr=subprocess.PIPE, text=True, bufsize=1
+                stderr=subprocess.PIPE, bufsize=0
             )
             tunnel_state["sub_process"] = p_sub
             threading.Thread(target=stream_reader, args=(p_sub, "cf-sub", False), daemon=True).start()
@@ -1361,12 +1477,12 @@ def sync_xray_policy_and_limits():
         print(f"[Traffic Shaping Error] {e}")
 
 def sync_3xui_with_tunnels():
-    vpn_host = tunnel_state.get("vpn_host")
-    if not vpn_host:
+    vpn_host = get_clean_vpn_host()
+    if not vpn_host or vpn_host == "127.0.0.1":
         return
     try:
         s, base_url = get_3xui_auth_session()
-        r = s.get(f"{base_url}/panel/api/inbounds/list", timeout=4)
+        r = s.get(f"{base_url}/panel/api/inbounds/list", timeout=2.0)
         if r.status_code == 200:
             data = r.json()
             inbounds = data.get("obj", [])
@@ -1383,7 +1499,7 @@ def sync_3xui_with_tunnels():
                     }),
                     "sniffing": json.dumps({"enabled": True, "destOverride": ["http", "tls", "quic", "fakedns"]})
                 }
-                s.post(f"{base_url}/panel/api/inbounds/add", json=new_inbound, timeout=4)
+                s.post(f"{base_url}/panel/api/inbounds/add", json=new_inbound, timeout=2.0)
             elif inbound:
                 stream_settings = inbound.get("streamSettings")
                 if isinstance(stream_settings, str):
@@ -1401,7 +1517,7 @@ def sync_3xui_with_tunnels():
                         inbound["settings"] = json.dumps(inbound["settings"])
                     if isinstance(inbound.get("sniffing"), dict):
                         inbound["sniffing"] = json.dumps(inbound["sniffing"])
-                    r_upd = s.post(f"{base_url}/panel/api/inbounds/update/{inbound['id']}", json=inbound, timeout=4)
+                    r_upd = s.post(f"{base_url}/panel/api/inbounds/update/{inbound['id']}", json=inbound, timeout=2.0)
                     if r_upd.status_code == 200:
                         print(f"[3x-ui Sync] Inbound 10000 updated with Host={vpn_host}")
         sync_xray_policy_and_limits()
@@ -1495,9 +1611,9 @@ def generate_qr_b64(text: str) -> str:
     img.save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
-def build_sub_link(sub_id: str, format_type: str = "smart") -> str:
-    portal_host = tunnel_state.get("portal_host") or tunnel_state.get("sub_host")
-    base = f"https://{portal_host}" if portal_host else "http://127.0.0.1:8080"
+def build_sub_link(sub_id: str, format_type: str = "smart", request: Optional[Request] = None) -> str:
+    portal_host = get_clean_portal_host(request)
+    base = f"https://{portal_host}" if portal_host else f"http://127.0.0.1:{PORTAL_PORT}"
     if format_type == "json":
         return f"{base}/sub/json/{sub_id}"
     elif format_type == "vless":
@@ -1557,11 +1673,8 @@ def build_resilient_singbox_profile(client_uuid: str, client_name: str, vpn_host
                     "enabled": True,
                     "fingerprint": "firefox"
                 },
-                "fragment": {
-                    "enabled": True,
-                    "length": "50-100",
-                    "interval": "10-20"
-                }
+                "fragment": True,
+                "fragment_fallback_delay": "500ms"
             },
             "transport": {
                 "type": "ws",
@@ -1594,11 +1707,8 @@ def build_resilient_singbox_profile(client_uuid: str, client_name: str, vpn_host
                     "enabled": True,
                     "fingerprint": "firefox"
                 },
-                "fragment": {
-                    "enabled": True,
-                    "length": "50-100",
-                    "interval": "10-20"
-                }
+                "fragment": True,
+                "fragment_fallback_delay": "500ms"
             },
             "transport": {
                 "type": "httpupgrade",
@@ -1723,6 +1833,16 @@ def build_resilient_singbox_profile(client_uuid: str, client_name: str, vpn_host
             "auto_detect_interface": True
         }
     }
+
+    # Strict Sing-box schema verification: ensure tls.fragment is boolean and never a dictionary
+    for ob in profile.get("outbounds", []):
+        tls_cfg = ob.get("tls")
+        if isinstance(tls_cfg, dict):
+            if isinstance(tls_cfg.get("fragment"), dict) or tls_cfg.get("fragment") is None:
+                tls_cfg["fragment"] = True
+            if "fragment_fallback_delay" not in tls_cfg:
+                tls_cfg["fragment_fallback_delay"] = "500ms"
+
     return profile
 
 def build_farsi_instructions(email: str, sub_url: str) -> str:
@@ -1767,6 +1887,7 @@ app.mount("/rules", StaticFiles(directory=RULES_DIR), name="rules")
 
 class UnifiedAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
+        update_tunnel_state_from_request(request)
         path = request.url.path
 
         # 1. Public Paths
@@ -1809,15 +1930,23 @@ app.add_middleware(UnifiedAuthMiddleware)
 # ----------------- Public Subscription Endpoints ----------------- #
 
 @app.get("/sub/json/{sub_id}", response_class=JSONResponse)
-def get_singbox_subscription(sub_id: str):
-    ib = get_inbound_and_clients()
-    if not ib:
-        raise HTTPException(status_code=503, detail="3x-ui server is offline")
-    settings = ib.get("settings", {})
-    if isinstance(settings, str):
-        settings = json.loads(settings)
-    clients = settings.get("clients", [])
-    target = next((c for c in clients if c.get("subId") == sub_id or c.get("email") == sub_id), None)
+def get_singbox_subscription(sub_id: str, request: Request):
+    if request:
+        update_tunnel_state_from_request(request)
+    detect_tunnel_urls_from_logs()
+
+    target = None
+    try:
+        ib = get_inbound_and_clients()
+        if ib:
+            settings = ib.get("settings", {})
+            if isinstance(settings, str):
+                settings = json.loads(settings)
+            clients = settings.get("clients", [])
+            target = next((c for c in clients if c.get("subId") == sub_id or c.get("email") == sub_id), None)
+    except Exception as e:
+        print(f"[Sub JSON 3x-ui Error] {e}")
+
     if not target:
         conn = get_db()
         cur = conn.cursor()
@@ -1829,8 +1958,8 @@ def get_singbox_subscription(sub_id: str):
         else:
             raise HTTPException(status_code=404, detail="Subscription not found")
 
-    vpn_host = tunnel_state.get("vpn_host") or "127.0.0.1"
-    sub_host = tunnel_state.get("portal_host") or "127.0.0.1"
+    vpn_host = get_clean_vpn_host()
+    sub_host = get_clean_portal_host(request) or "127.0.0.1"
     profile = build_resilient_singbox_profile(target.get("id"), target.get("email", "VPN"), vpn_host, sub_host)
     return JSONResponse(content=profile, headers={
         "Content-Disposition": f'attachment; filename="{target.get("email", "vpn")}-singbox.json"',
@@ -1839,15 +1968,23 @@ def get_singbox_subscription(sub_id: str):
     })
 
 @app.get("/sub/vless/{sub_id}", response_class=PlainTextResponse)
-def get_vless_subscription(sub_id: str):
-    ib = get_inbound_and_clients()
-    if not ib:
-        raise HTTPException(status_code=503, detail="3x-ui server is offline")
-    settings = ib.get("settings", {})
-    if isinstance(settings, str):
-        settings = json.loads(settings)
-    clients = settings.get("clients", [])
-    target = next((c for c in clients if c.get("subId") == sub_id or c.get("email") == sub_id), None)
+def get_vless_subscription(sub_id: str, request: Request):
+    if request:
+        update_tunnel_state_from_request(request)
+    detect_tunnel_urls_from_logs()
+
+    target = None
+    try:
+        ib = get_inbound_and_clients()
+        if ib:
+            settings = ib.get("settings", {})
+            if isinstance(settings, str):
+                settings = json.loads(settings)
+            clients = settings.get("clients", [])
+            target = next((c for c in clients if c.get("subId") == sub_id or c.get("email") == sub_id), None)
+    except Exception as e:
+        print(f"[Sub VLESS 3x-ui Error] {e}")
+
     if not target:
         conn = get_db()
         cur = conn.cursor()
@@ -1859,7 +1996,7 @@ def get_vless_subscription(sub_id: str):
         else:
             raise HTTPException(status_code=404, detail="Subscription not found")
 
-    vpn_host = tunnel_state.get("vpn_host") or "127.0.0.1"
+    vpn_host = get_clean_vpn_host()
     uris = build_resilient_vless_links(target.get("id"), target.get("email", "VPN"), vpn_host)
     joined = "\n".join(uris)
     b64 = base64.b64encode(joined.encode("utf-8")).decode("utf-8")
@@ -1872,18 +2009,19 @@ def get_vless_subscription(sub_id: str):
 
 @app.get("/sub/{sub_id}")
 def get_smart_subscription(sub_id: str, request: Request, format: Optional[str] = None):
+    update_tunnel_state_from_request(request)
     ua = request.headers.get("user-agent", "").lower()
     accept = request.headers.get("accept", "").lower()
 
     if format == "json" or format == "singbox":
-        return get_singbox_subscription(sub_id)
+        return get_singbox_subscription(sub_id, request)
     elif format == "vless" or format == "base64":
-        return get_vless_subscription(sub_id)
+        return get_vless_subscription(sub_id, request)
 
     if any(k in ua for k in ["hiddify", "sing-box", "foxray", "box"]) or "application/json" in accept:
-        return get_singbox_subscription(sub_id)
+        return get_singbox_subscription(sub_id, request)
     else:
-        return get_vless_subscription(sub_id)
+        return get_vless_subscription(sub_id, request)
 
 # ----------------- Auth API Endpoints (Login, Register, Logout) ----------------- #
 
@@ -2010,6 +2148,9 @@ def handle_logout(request: Request):
 
 @app.get("/api/user/me")
 def api_get_my_info(request: Request):
+    update_tunnel_state_from_request(request)
+    detect_tunnel_urls_from_logs()
+
     session = get_session(request)
     if not session:
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -2076,12 +2217,12 @@ def api_get_my_info(request: Request):
     last_seen_en = user_act.get("last_seen_en", "Never")
     last_seen_fa = user_act.get("last_seen_fa", "تاکنون متصل نشده")
 
-    smart_sub_link = build_sub_link(sub_id, "smart")
-    json_sub_link = build_sub_link(sub_id, "json")
-    vless_sub_link = build_sub_link(sub_id, "vless")
+    smart_sub_link = build_sub_link(sub_id, "smart", request)
+    json_sub_link = build_sub_link(sub_id, "json", request)
+    vless_sub_link = build_sub_link(sub_id, "vless", request)
     qr_b64 = generate_qr_b64(json_sub_link)
 
-    vpn_host = tunnel_state.get("vpn_host") or "127.0.0.1"
+    vpn_host = get_clean_vpn_host()
     vless_links = build_resilient_vless_links(client_uuid, email, vpn_host)
 
     expiry_str = "Never (دائمی)"
@@ -2118,19 +2259,27 @@ def api_get_my_info(request: Request):
     }
 
 @app.get("/api/status")
-def get_api_status():
+def get_api_status(request: Request):
+    update_tunnel_state_from_request(request)
+    detect_tunnel_urls_from_logs()
+
     admin_info = get_current_credentials_display()
+    portal_host = get_clean_portal_host(request)
+    portal_url = f"https://{portal_host}" if portal_host else f"http://127.0.0.1:{PORTAL_PORT}"
+    vpn_host = get_clean_vpn_host()
+    vpn_url = f"https://{vpn_host}" if vpn_host != "127.0.0.1" else "Initializing..."
+
     return {
         "xui_running": is_port_open(2053),
         "inbound_running": is_port_open(10000),
-        "vpn_url": tunnel_state.get("vpn_url") or "Initializing...",
-        "vpn_host": tunnel_state.get("vpn_host") or "Pending...",
-        "sub_url": tunnel_state.get("sub_url") or "Initializing...",
-        "sub_host": tunnel_state.get("sub_host") or "Pending...",
-        "portal_url": tunnel_state.get("portal_url") or "Initializing...",
-        "portal_host": tunnel_state.get("portal_host") or "Pending...",
-        "local_portal_url": "http://127.0.0.1:8080",
-        "engine_url": "http://127.0.0.1:2053",
+        "vpn_url": vpn_url,
+        "vpn_host": vpn_host if vpn_host != "127.0.0.1" else "Pending...",
+        "sub_url": portal_url,
+        "sub_host": portal_host if portal_host else "Pending...",
+        "portal_url": portal_url,
+        "portal_host": portal_host if portal_host else "Pending...",
+        "local_portal_url": f"http://127.0.0.1:{PORTAL_PORT}",
+        "engine_url": f"http://127.0.0.1:{XUI_PORT}",
         "admin_username": admin_info.get("username", "admin"),
         "admin_password": admin_info.get("password", "********"),
         "is_custom_password": admin_info.get("is_custom", False),
@@ -2142,37 +2291,48 @@ def get_api_status():
 # ----------------- Admin API Endpoints ----------------- #
 
 @app.get("/api/admin/overview")
-def api_admin_overview():
+def api_admin_overview(request: Request):
+    update_tunnel_state_from_request(request)
+    detect_tunnel_urls_from_logs()
+
     invite_code = get_invite_code()
-    portal_host = tunnel_state.get("portal_host") or tunnel_state.get("sub_host")
+    portal_host = get_clean_portal_host(request)
     shareable_invite_url = f"https://{portal_host}/?invite={invite_code}" if portal_host else f"http://127.0.0.1:{PORTAL_PORT}/?invite={invite_code}"
+    portal_url = f"https://{portal_host}" if portal_host else f"http://127.0.0.1:{PORTAL_PORT}"
+    vpn_host = get_clean_vpn_host()
+    vpn_url = f"https://{vpn_host}" if vpn_host != "127.0.0.1" else "Connecting..."
+
     lan_ip = get_lan_ip()
     lan_portal_url = f"http://{lan_ip}:{PORTAL_PORT}"
     local_portal_url = f"http://127.0.0.1:{PORTAL_PORT}"
 
     # Query all users & clients
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM users WHERE role != 'admin'")
-    total_db_users = cur.fetchone()[0]
-    conn.close()
+    total_db_users = 0
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM users WHERE role != 'admin'")
+        total_db_users = cur.fetchone()[0]
+        conn.close()
+    except Exception as e:
+        print(f"[Admin Overview DB Error] {e}")
 
-    ib = get_inbound_and_clients()
     total_up = 0
     total_down = 0
     client_count = 0
-    if ib:
-        stats = ib.get("clientStats") or []
-        for s in stats:
-            total_up += s.get("up", 0)
-            total_down += s.get("down", 0)
-        settings = ib.get("settings", {})
-        if isinstance(settings, str):
-            try:
+    try:
+        ib = get_inbound_and_clients()
+        if ib:
+            stats = ib.get("clientStats") or []
+            for s in stats:
+                total_up += s.get("up", 0)
+                total_down += s.get("down", 0)
+            settings = ib.get("settings", {})
+            if isinstance(settings, str):
                 settings = json.loads(settings)
-            except Exception:
-                settings = {}
-        client_count = len(settings.get("clients", []))
+            client_count = len(settings.get("clients", []))
+    except Exception as e:
+        print(f"[Admin Overview 3x-ui Error] {e}")
 
     total_users_count = max(total_db_users, client_count)
 
@@ -2198,10 +2358,10 @@ def api_admin_overview():
         "portal_port": PORTAL_PORT,
         "failing_domains_count": len(failing_domains),
         "watchdog_status": tunnel_state.get("watchdog_status", "Healthy"),
-        "vpn_url": tunnel_state.get("vpn_url") or "Connecting...",
-        "vpn_host": tunnel_state.get("vpn_host") or "Pending...",
-        "portal_url": tunnel_state.get("portal_url") or "Connecting...",
-        "portal_host": tunnel_state.get("portal_host") or "Pending...",
+        "vpn_url": vpn_url,
+        "vpn_host": vpn_host if vpn_host != "127.0.0.1" else "Pending...",
+        "portal_url": portal_url,
+        "portal_host": portal_host if portal_host else "Pending...",
         "cf_auto_optimize": get_cf_optimizer_state().get("auto_optimize", True),
         "cf_ip_override": get_cf_ip_override(),
         "cf_active_edge_ip": get_active_clean_ips()[0][0],
@@ -2313,40 +2473,75 @@ def api_set_cf_ip_override(req: CfIpOverrideReq):
     return {"success": True, "ip": clean_ip, "active_ip": get_active_clean_ips()[0][0]}
 
 @app.get("/api/clients")
-def list_clients():
+def list_clients(request: Request):
+    update_tunnel_state_from_request(request)
+    detect_tunnel_urls_from_logs()
+
     user_bw_map = {}
+    db_users = []
     try:
         conn_bw = get_db()
         cur_bw = conn_bw.cursor()
-        cur_bw.execute("SELECT email, uuid, bandwidth_limit_mbps FROM users")
+        cur_bw.execute("SELECT id, name, email, uuid, sub_id, role, bandwidth_limit_mbps FROM users")
         for r in cur_bw.fetchall():
             bw = r["bandwidth_limit_mbps"] if ("bandwidth_limit_mbps" in r.keys() and r["bandwidth_limit_mbps"] is not None) else 10
             if r["email"]:
                 user_bw_map[r["email"].lower()] = int(bw)
             if r["uuid"]:
                 user_bw_map[r["uuid"]] = int(bw)
+            if r["email"] and r["role"] != "admin":
+                db_users.append(dict(r))
         conn_bw.close()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[List Clients DB Error] {e}")
 
-    ib = get_inbound_and_clients()
-    if not ib:
-        return {"clients": [], "total_up": 0, "total_down": 0}
+    raw_clients = []
+    client_stats = []
+    try:
+        ib = get_inbound_and_clients()
+        if ib:
+            settings = ib.get("settings", {})
+            if isinstance(settings, str):
+                settings = json.loads(settings)
+            raw_clients = settings.get("clients", [])
+            client_stats = ib.get("clientStats") or []
+    except Exception as e:
+        print(f"[List Clients 3x-ui Error] {e}")
 
-    settings = ib.get("settings", {})
-    if isinstance(settings, str):
-        settings = json.loads(settings)
-    raw_clients = settings.get("clients", [])
-    client_stats = ib.get("clientStats") or []
+    # Fallback to DB users if 3x-ui is empty or unreachable
+    if not raw_clients and db_users:
+        raw_clients = [
+            {
+                "id": u.get("uuid"),
+                "email": u.get("email"),
+                "subId": u.get("sub_id") or u.get("email"),
+                "totalGB": 0,
+                "expiryTime": 0,
+                "enable": True
+            }
+            for u in db_users
+        ]
+    elif db_users:
+        existing_emails = {c.get("email", "").lower() for c in raw_clients}
+        for u in db_users:
+            if u.get("email", "").lower() not in existing_emails:
+                raw_clients.append({
+                    "id": u.get("uuid"),
+                    "email": u.get("email"),
+                    "subId": u.get("sub_id") or u.get("email"),
+                    "totalGB": 0,
+                    "expiryTime": 0,
+                    "enable": True
+                })
+
     stats_map = {cs.get("email"): cs for cs in client_stats if cs.get("email")}
-
     activity_map = get_all_users_activity()
 
     result = []
     total_up = 0
     total_down = 0
     now_ms = int(time.time() * 1000)
-    vpn_host = tunnel_state.get("vpn_host") or "127.0.0.1"
+    vpn_host = get_clean_vpn_host()
 
     for c in raw_clients:
         email = c.get("email", "Unknown")
@@ -2376,9 +2571,9 @@ def list_clients():
         sub_id = c.get("subId", email)
         client_uuid = c.get("id")
 
-        smart_sub_link = build_sub_link(sub_id, "smart")
-        json_sub_link = build_sub_link(sub_id, "json")
-        vless_sub_link = build_sub_link(sub_id, "vless")
+        smart_sub_link = build_sub_link(sub_id, "smart", request)
+        json_sub_link = build_sub_link(sub_id, "json", request)
+        vless_sub_link = build_sub_link(sub_id, "vless", request)
         vless_links = build_resilient_vless_links(client_uuid, email, vpn_host)
         smart_qr_b64 = generate_qr_b64(json_sub_link)
 
@@ -3659,10 +3854,15 @@ DASHBOARD_PAGE_HTML = """<!DOCTYPE html>
           window.location.href = '/login';
           return;
         }
+        if (!res.ok) throw new Error('HTTP ' + res.status);
         userData = await res.json();
         updateDisplay();
       } catch (e) {
         console.error('Error fetching user info:', e);
+        const st = document.getElementById('txtConnectionStatus');
+        if (st && (st.textContent.includes('بررسی') || st.textContent.includes('Checking'))) {
+          st.textContent = (currentLang === 'fa') ? 'خطا در بارگذاری اطلاعات' : 'Failed to load details';
+        }
       }
     }
 
@@ -4128,6 +4328,7 @@ ADMIN_PAGE_HTML = """<!DOCTYPE html>
       try {
         const res = await fetch('/api/admin/overview');
         if (res.status === 401) { window.location.href = '/login'; return; }
+        if (!res.ok) throw new Error('HTTP ' + res.status);
         overviewData = await res.json();
         
         document.getElementById('heroOnlineCount').textContent = overviewData.online_users || 0;
@@ -4135,28 +4336,43 @@ ADMIN_PAGE_HTML = """<!DOCTYPE html>
           ? `مجموع ${overviewData.total_users || 0} کاربر خانواده ثبت‌نام شده` 
           : `Total ${overviewData.total_users || 0} family members registered`;
 
-        const publicUrl = overviewData.shareable_invite_url || overviewData.portal_url || window.location.origin;
+        let publicUrl = overviewData.shareable_invite_url || overviewData.portal_url;
+        if (!publicUrl || publicUrl.includes('Pending...') || publicUrl.includes('Connecting...')) {
+          const invite = overviewData.invite_code || currentInviteCode || '';
+          publicUrl = `${window.location.origin}/?invite=${invite}`;
+        }
         document.getElementById('heroPublicUrl').textContent = publicUrl;
 
         currentInviteCode = overviewData.invite_code || 'FAMILY2026';
         document.getElementById('heroInviteCode').textContent = currentInviteCode;
 
         if (overviewData.cf_active_edge_ip) {
-          document.getElementById('cfActiveIpDisplay').textContent = `Active: ${overviewData.cf_active_edge_ip} (${overviewData.cf_latency_ms || 0}ms)`;
+          const cfEl = document.getElementById('cfActiveIpDisplay');
+          if (cfEl) cfEl.textContent = `Active: ${overviewData.cf_active_edge_ip} (${overviewData.cf_latency_ms || 0}ms)`;
         }
       } catch (e) {
         console.error('Overview error:', e);
+        const heroEl = document.getElementById('heroPublicUrl');
+        if (heroEl && (heroEl.textContent.includes('اتصال') || heroEl.textContent.includes('Connecting'))) {
+          heroEl.textContent = `${window.location.origin}/?invite=${currentInviteCode || ''}`;
+        }
       }
     }
 
     async function fetchClients() {
       try {
         const res = await fetch('/api/clients');
+        if (res.status === 401) { window.location.href = '/login'; return; }
+        if (!res.ok) throw new Error('HTTP ' + res.status);
         const data = await res.json();
         clientsData = data.clients || [];
         renderClientsTable(clientsData);
       } catch (e) {
         console.error('Clients error:', e);
+        const tbody = document.getElementById('clientsTableBody');
+        if (tbody) {
+          tbody.innerHTML = `<tr><td colspan="5" class="p-8 text-center text-rose-400">${currentLang === 'fa' ? 'خطا در بارگذاری کاربران' : 'Failed to load users'}</td></tr>`;
+        }
       }
     }
 
