@@ -111,8 +111,16 @@ record("Phase 2", "Admin Authentication (/api/login)", login_success, f"HTTP {r_
 
 # 2.2 Verify /admin responds HTTP 200 with new design elements
 r_admin = session.get(f"{BASE_URL}/admin", timeout=5)
-admin_page_ok = (r_admin.status_code == 200) and ("heroOnlineCount" in r_admin.text) and ("heroPublicUrl" in r_admin.text) and ("heroInviteCode" in r_admin.text) and ("thSpeed" in r_admin.text)
-record("Phase 2", "Admin Dashboard HTTP 200 & Hero Bar", admin_page_ok, "HTTP 200, Hero Bar (3 metrics) & Clean Table rendered")
+admin_page_ok = (
+    (r_admin.status_code == 200) and 
+    ("heroOnlineCount" in r_admin.text) and 
+    ("heroPublicUrl" in r_admin.text) and 
+    ("heroTunnelIp" in r_admin.text) and 
+    ("heroInviteCode" in r_admin.text) and 
+    ("thSpeed" in r_admin.text) and 
+    ("connectedIpLabel" in r_admin.text)
+)
+record("Phase 2", "Admin Dashboard HTTP 200 & Hero Bar", admin_page_ok, "HTTP 200, Hero Bar (4 metrics including Active Tunnel IP) & Clean Table with Last IP rendered")
 
 # 2.3 Bandwidth limit update flow (10 -> 20 -> 10)
 # Fetch existing clients

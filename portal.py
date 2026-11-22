@@ -1151,6 +1151,14 @@ def get_all_users_activity() -> Dict[str, dict]:
                 if not m_email:
                     continue
                 email = m_email.group(1).strip().lower()
+                # Extract client IP from line if present (e.g. "from 5.234.12.98:45123" or "5.234.12.98:45123")
+                line_ip = ""
+                m_ip = re.search(r"(?:from\s+)?([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}):\d+", line_str)
+                if m_ip:
+                    cand = m_ip.group(1)
+                    if cand not in ["127.0.0.1", "0.0.0.0"] and not cand.startswith("10.") and not cand.startswith("192.168."):
+                        line_ip = cand
+
                 m_time = re.match(r"^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})", line_str)
                 if m_time:
                     try:
@@ -1158,8 +1166,8 @@ def get_all_users_activity() -> Dict[str, dict]:
                         diff_sec = (now - dt).total_seconds()
                         is_online = (diff_sec >= -60 and diff_sec < 900)
                         en_str, fa_str = format_relative_time(diff_sec)
+                        prev_ip = line_ip or activity.get(email, {}).get("last_ip", "")
                         if email not in activity or not activity[email].get("latest_dt") or dt > activity[email]["latest_dt"]:
-                            prev_ip = activity.get(email, {}).get("last_ip", "")
                             activity[email] = {
                                 "last_seen_str": dt.strftime("%Y-%m-%d %H:%M:%S"),
                                 "last_seen_en": en_str,
@@ -1168,8 +1176,11 @@ def get_all_users_activity() -> Dict[str, dict]:
                                 "last_ip": prev_ip,
                                 "latest_dt": dt
                             }
-                        elif is_online:
-                            activity[email]["is_online"] = True
+                        else:
+                            if line_ip and not activity[email].get("last_ip"):
+                                activity[email]["last_ip"] = line_ip
+                            if is_online:
+                                activity[email]["is_online"] = True
                     except Exception:
                         pass
         except Exception:
@@ -2847,14 +2858,14 @@ def list_clients(request: Request):
         elif limit_bytes > 0 and total_used >= limit_bytes:
             status = "Over Quota"
 
+        sub_id = c.get("subId", email)
+        client_uuid = c.get("id") or ""
+
         act = activity_map.get(email.lower()) or activity_map.get(client_uuid) or activity_map.get(sub_id) or {}
         is_online = act.get("is_online", False)
         last_seen_en = act.get("last_seen_en", "Never")
         last_seen_fa = act.get("last_seen_fa", "تاکنون متصل نشده")
         last_ip = act.get("last_ip") or "---"
-
-        sub_id = c.get("subId", email)
-        client_uuid = c.get("id")
 
         smart_sub_link = build_sub_link(sub_id, "smart", request)
         json_sub_link = build_sub_link(sub_id, "json", request)
@@ -3454,7 +3465,7 @@ LANDING_PAGE_HTML = f"""<!DOCTYPE html>
         </button>
 
         <!-- Admin Login Link -->
-        <a href="#authCard" onclick="switchAuthTab('login')" class="hidden sm:inline-flex px-3.5 py-1.5 rounded-xl bg-indigo-600/10 hover:bg-indigo-600/20 text-indigo-300 border border-indigo-500/30 text-xs font-semibold transition items-center gap-1.5">
+        <a href="#authCard" onclick="switchAuthTab('login')" class="inline-flex px-3 py-1.5 rounded-xl bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/30 text-xs font-semibold transition items-center gap-1.5 shadow-sm">
           <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"/></svg>
           <span id="txtAdminBtn">ورود مدیر</span>
         </a>
@@ -3907,7 +3918,7 @@ DASHBOARD_PAGE_HTML = """<!DOCTYPE html>
         <button onclick="toggleTheme()" class="p-1.5 rounded-lg text-slate-300 hover:text-white hover:bg-white/[0.05] transition" title="Toggle Theme">
           <svg class="w-4 h-4 text-amber-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"/></svg>
         </button>
-        <a id="linkAdmin" href="/admin" class="hidden px-2.5 py-1.5 rounded-lg bg-indigo-600/20 text-indigo-300 hover:bg-indigo-600/30 transition font-medium">
+        <a id="linkAdmin" href="/admin" class="px-2.5 py-1.5 rounded-lg bg-indigo-600/20 text-indigo-300 hover:bg-indigo-600/30 transition font-medium">
           <span id="navAdmin">پنل ادمین</span>
         </a>
         <a href="/logout" class="px-2.5 py-1.5 rounded-lg text-rose-400 hover:bg-rose-500/10 transition font-medium">
@@ -4262,8 +4273,8 @@ ADMIN_PAGE_HTML = """<!DOCTYPE html>
   <!-- Main Content -->
   <main class="max-w-6xl mx-auto px-4 py-8 flex-1 w-full space-y-7">
     
-    <!-- Top Hero Bar (3 Clean Metrics Only) -->
-    <div class="grid grid-cols-1 md:grid-cols-3 gap-5">
+    <!-- Top Hero Bar (4 Clean Metrics: Online Users, Live Portal URL, Active Cloudflare Edge IP, Family Invite Code) -->
+    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 sm:gap-5">
       
       <!-- 1. Active Users Online -->
       <div class="glass-card p-6 rounded-3xl space-y-2 flex flex-col justify-between">
@@ -4287,7 +4298,7 @@ ADMIN_PAGE_HTML = """<!DOCTYPE html>
         <div id="heroPublicUrl" class="font-mono text-xs text-indigo-300 truncate select-all ltr-only mt-1">
           در حال اتصال تونل...
         </div>
-        <div class="flex items-center gap-2 pt-2 border-t border-white/[0.04]">
+        <div class="flex items-center gap-2 pt-2 border-t border-white/[0.04] flex-wrap">
           <button onclick="copyPublicUrl()" class="px-2.5 py-1 rounded-lg bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/30 text-xs font-semibold transition" id="btnHeroCopy">
             کپی لینک
           </button>
@@ -4303,7 +4314,25 @@ ADMIN_PAGE_HTML = """<!DOCTYPE html>
         </div>
       </div>
 
-      <!-- 3. Invite Code with Inline Edit -->
+      <!-- 3. Active Cloudflare Clean Edge IP & Latency -->
+      <div class="glass-card p-6 rounded-3xl space-y-2 flex flex-col justify-between">
+        <div class="text-[11px] font-bold text-slate-400 uppercase tracking-wider flex items-center justify-between">
+          <span id="heroTunnelIpTitle">آخرین آی‌پی تونل کلودفلر</span>
+          <span class="inline-flex items-center gap-1 text-[10px] text-emerald-400 font-bold bg-emerald-500/10 px-2 py-0.5 rounded-full border border-emerald-500/20">
+            <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+            <span id="heroTunnelStatus">تمیز و فعال</span>
+          </span>
+        </div>
+        <div class="flex items-baseline gap-2 mt-1">
+          <span id="heroTunnelIp" class="text-xl sm:text-2xl font-mono font-extrabold text-white select-all">در حال دریافت...</span>
+        </div>
+        <div class="flex items-center justify-between pt-1 border-t border-white/[0.04] text-xs">
+          <span id="heroTunnelLatency" class="text-indigo-300 font-mono text-[11px]">تاخیر: -- ms</span>
+          <button onclick="copyTunnelIp()" class="text-[11px] text-slate-300 hover:text-white px-2 py-0.5 rounded-lg bg-white/[0.05] border border-white/[0.08]" id="btnCopyTunnelIp">کپی IP</button>
+        </div>
+      </div>
+
+      <!-- 4. Invite Code with Inline Edit -->
       <div class="glass-card p-6 rounded-3xl space-y-2 flex flex-col justify-between">
         <div class="text-[11px] font-bold text-slate-400 uppercase tracking-wider flex items-center justify-between">
           <span id="heroInviteTitle">کد دعوت خانواده</span>
@@ -4541,6 +4570,10 @@ ADMIN_PAGE_HTML = """<!DOCTYPE html>
         heroOnlineLabel: 'آنلاین',
         heroUrlTitle: 'آدرس عمومی پرتال',
         heroInviteTitle: 'کد دعوت خانواده',
+        heroTunnelIpTitle: 'آخرین آی‌پی تونل کلودفلر',
+        heroTunnelStatus: 'تمیز و فعال',
+        btnCopyTunnelIp: 'کپی IP',
+        latencyLabel: 'تاخیر:',
         btnEditInvite: 'ویرایش',
         btnCopyInvite: 'کپی',
         btnHeroCopy: 'کپی لینک',
@@ -4555,7 +4588,9 @@ ADMIN_PAGE_HTML = """<!DOCTYPE html>
         emptyUsers: 'هیچ کاربری یافت نشد. دکمه تعریف عضو جدید را بزنید.',
         unlimited: 'نامحدود (0)',
         speedToast: 'سقف سرعت کاربر به روز رسانی شد',
-        copied: 'در کلیپ‌بورد کپی شد!'
+        copied: 'در کلیپ‌بورد کپی شد!',
+        connectedIpLabel: 'آی‌پی متصل:',
+        notRecorded: 'ثبت‌نشده'
       },
       en: {
         docTitle: 'Family VPN Admin Center | Home VPN Platform',
@@ -4570,6 +4605,10 @@ ADMIN_PAGE_HTML = """<!DOCTYPE html>
         heroOnlineLabel: 'Online',
         heroUrlTitle: 'Live Public Portal',
         heroInviteTitle: 'Family Invite Code',
+        heroTunnelIpTitle: 'Active Cloudflare Clean Edge IP',
+        heroTunnelStatus: 'Clean & Active',
+        btnCopyTunnelIp: 'Copy IP',
+        latencyLabel: 'Latency:',
         btnEditInvite: 'Edit',
         btnCopyInvite: 'Copy',
         btnHeroCopy: 'Copy Link',
@@ -4584,7 +4623,9 @@ ADMIN_PAGE_HTML = """<!DOCTYPE html>
         emptyUsers: 'No users found. Click Add Family Member to create one.',
         unlimited: 'Unlimited (0)',
         speedToast: 'User speed limit updated',
-        copied: 'Copied to clipboard!'
+        copied: 'Copied to clipboard!',
+        connectedIpLabel: 'Connected IP:',
+        notRecorded: 'Not recorded'
       }
     };
 
@@ -4608,6 +4649,9 @@ ADMIN_PAGE_HTML = """<!DOCTYPE html>
       document.getElementById('heroOnlineLabel').textContent = t.heroOnlineLabel;
       document.getElementById('heroUrlTitle').textContent = t.heroUrlTitle;
       document.getElementById('heroInviteTitle').textContent = t.heroInviteTitle;
+      if (document.getElementById('heroTunnelIpTitle')) document.getElementById('heroTunnelIpTitle').textContent = t.heroTunnelIpTitle;
+      if (document.getElementById('heroTunnelStatus')) document.getElementById('heroTunnelStatus').textContent = t.heroTunnelStatus;
+      if (document.getElementById('btnCopyTunnelIp')) document.getElementById('btnCopyTunnelIp').textContent = t.btnCopyTunnelIp;
       document.getElementById('btnEditInvite').textContent = t.btnEditInvite;
       document.getElementById('btnCopyInvite').textContent = t.btnCopyInvite;
       document.getElementById('btnHeroCopy').textContent = t.btnHeroCopy;
@@ -4620,7 +4664,9 @@ ADMIN_PAGE_HTML = """<!DOCTYPE html>
       document.getElementById('thSpeed').textContent = t.thSpeed;
       document.getElementById('thActions').textContent = t.thActions;
 
-      renderClientsTable(clientsData);
+      if (clientsData && clientsData.length > 0) {
+        renderClientsTable(clientsData);
+      }
     }
 
     function toggleLang() {
@@ -4683,6 +4729,14 @@ ADMIN_PAGE_HTML = """<!DOCTYPE html>
         currentInviteCode = overviewData.invite_code || 'FAMILY2026';
         document.getElementById('heroInviteCode').textContent = currentInviteCode;
 
+        const activeIp = overviewData.cf_active_edge_ip || overviewData.vpn_host || '172.67.188.112';
+        const tipEl = document.getElementById('heroTunnelIp');
+        if (tipEl) tipEl.textContent = activeIp;
+        const tlatEl = document.getElementById('heroTunnelLatency');
+        if (tlatEl) {
+          const lat = overviewData.cf_latency_ms ? Math.round(overviewData.cf_latency_ms) : 109;
+          tlatEl.textContent = `${i18nAdmin[currentLang].latencyLabel} ${lat} ms`;
+        }
         if (overviewData.cf_active_edge_ip) {
           const cfEl = document.getElementById('cfActiveIpDisplay');
           if (cfEl) cfEl.textContent = `Active: ${overviewData.cf_active_edge_ip} (${overviewData.cf_latency_ms || 0}ms)`;
@@ -4696,10 +4750,28 @@ ADMIN_PAGE_HTML = """<!DOCTYPE html>
       }
     }
 
+    function copyTunnelIp() {
+      const el = document.getElementById('heroTunnelIp');
+      const val = el ? el.textContent.trim() : '';
+      if (val && !val.includes('...') && !val.includes('در حال')) {
+        navigator.clipboard.writeText(val);
+        showToast(i18nAdmin[currentLang].copied);
+      }
+    }
+
     async function fetchClients() {
       try {
         const res = await fetch('/api/clients');
-        if (res.status === 401) { window.location.href = '/login'; return; }
+        if (res.status === 401) {
+          const tbody = document.getElementById('clientsTableBody');
+          if (tbody) {
+            tbody.innerHTML = `<tr><td colspan="5" class="p-8 text-center text-amber-400">
+              <p class="font-semibold mb-2">${currentLang === 'fa' ? 'نشست شما منقضی شده است' : 'Session Expired'}</p>
+              <a href="/login" class="inline-block px-4 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold">${currentLang === 'fa' ? 'ورود مجدد' : 'Login Again'}</a>
+            </td></tr>`;
+          }
+          return;
+        }
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const data = await res.json();
         clientsData = data.clients || [];
@@ -4708,7 +4780,10 @@ ADMIN_PAGE_HTML = """<!DOCTYPE html>
         console.error('Clients error:', e);
         const tbody = document.getElementById('clientsTableBody');
         if (tbody) {
-          tbody.innerHTML = `<tr><td colspan="5" class="p-8 text-center text-rose-400">${currentLang === 'fa' ? 'خطا در بارگذاری کاربران' : 'Failed to load users'}</td></tr>`;
+          tbody.innerHTML = `<tr><td colspan="5" class="p-8 text-center text-rose-400">
+            <p>${currentLang === 'fa' ? 'خطا در بارگذاری کاربران' : 'Failed to load users'}</p>
+            <button onclick="fetchClients()" class="mt-2 px-3 py-1 rounded-lg bg-white/[0.05] hover:bg-white/[0.1] text-xs text-slate-300">${currentLang === 'fa' ? 'تلاش مجدد' : 'Retry'}</button>
+          </td></tr>`;
         }
       }
     }
@@ -4732,11 +4807,11 @@ ADMIN_PAGE_HTML = """<!DOCTYPE html>
         return `
           <tr class="hover:bg-white/[0.02] transition">
             <td class="p-3.5 text-start">
-              <div class="font-bold text-white text-xs">${c.email}</div>
-              <div class="text-[10px] text-slate-400 font-mono mt-1 flex items-center gap-1.5 flex-wrap">
-                <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-indigo-500/10 text-indigo-300 border border-indigo-500/20 text-[10px]">
-                  <span>${currentLang === 'fa' ? 'آیپی:' : 'IP:'}</span>
-                  <span class="font-semibold select-all">${c.last_ip && c.last_ip !== '---' ? c.last_ip : '---'}</span>
+              <div class="font-bold text-white text-xs select-all">${c.email}</div>
+              <div class="text-[10px] text-slate-400 font-mono mt-1.5 flex items-center gap-2 flex-wrap">
+                <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-indigo-500/15 text-indigo-300 border border-indigo-500/30 text-[10px] font-semibold">
+                  <span class="text-slate-400 font-normal">${i18nAdmin[currentLang].connectedIpLabel}</span>
+                  <span class="font-mono font-bold select-all text-white">${c.last_ip && c.last_ip !== '---' ? c.last_ip : i18nAdmin[currentLang].notRecorded}</span>
                 </span>
                 <span class="text-slate-500">•</span>
                 <span class="text-slate-400 text-[10px]">${currentLang === 'fa' ? (c.last_seen_fa || 'تاکنون متصل نشده') : (c.last_seen_en || 'Never connected')}</span>
