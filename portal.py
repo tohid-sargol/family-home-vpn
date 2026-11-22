@@ -5585,13 +5585,13 @@ Invite Code: ${currentInviteCode}`);
       try {
         const res = await fetch('/api/direct-domains');
         const d = await res.json();
-        document.getElementById('directDomainsTextarea').value = (d.domains || []).join('\n');
+        document.getElementById('directDomainsTextarea').value = (d.domains || []).join(String.fromCharCode(10));
       } catch (e) {}
     }
 
     async function saveDirectDomains() {
       const raw = document.getElementById('directDomainsTextarea').value;
-      const domains = raw.split('\n').map(x => x.trim()).filter(Boolean);
+      const domains = raw.split(String.fromCharCode(10)).map(x => x.trim()).filter(Boolean);
       try {
         const res = await fetch('/api/direct-domains', {
           method: 'POST',
@@ -5608,7 +5608,7 @@ Invite Code: ${currentInviteCode}`);
       try {
         const res = await fetch('/api/diagnostics/logs?limit=50');
         const d = await res.json();
-        out.textContent = (d.logs || []).map(l => `[${l.time}] [${l.level}] ${l.message}`).join('\n') || 'No logs recorded.';
+        out.textContent = (d.logs || []).map(l => `[${l.time}] [${l.level}] ${l.message}`).join(String.fromCharCode(10)) || 'No logs recorded.';
       } catch (e) {
         out.textContent = 'Failed to load logs.';
       }
@@ -6071,6 +6071,144 @@ def get_login_page(request: Request):
 def get_dashboard_page(request: Request):
     return HTMLResponse(DASHBOARD_PAGE_HTML)
 
+
+def render_admin_users_html(clients_list):
+    if not clients_list:
+        empty_mobile = '<div class="p-8 text-center text-slate-500">هیچ کاربری یافت نشد. دکمه تعریف عضو جدید را بزنید.</div>'
+        empty_table = '<tr><td colspan="5" class="p-8 text-center text-slate-500">هیچ کاربری یافت نشد. دکمه تعریف عضو جدید را بزنید.</td></tr>'
+        return empty_mobile, empty_table
+
+    mobile_cards = []
+    table_rows = []
+
+    for c in clients_list:
+        is_online = c.get("is_online", False)
+        last_seen_fa = c.get("last_seen_fa", "تاکنون متصل نشده")
+        status_badge_mobile = (
+            '<span class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-[10px] font-bold"><span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>آنلاین (متصل)</span>'
+            if is_online else (
+                f'<span class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-amber-500/10 text-amber-300 border border-amber-500/20 text-[10px] font-medium">{last_seen_fa}</span>'
+                if last_seen_fa and last_seen_fa != "تاکنون متصل نشده" else
+                '<span class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-white/[0.04] text-slate-400 border border-white/[0.06] text-[10px]">آماده اتصال</span>'
+            )
+        )
+        status_dot_desktop = (
+            '<span class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-[10px] font-bold"><span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>آنلاین</span>'
+            if is_online else (
+                f'<span class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-amber-500/10 text-amber-300 border border-amber-500/20 text-[10px] font-medium">{last_seen_fa}</span>'
+                if last_seen_fa and last_seen_fa != "تاکنون متصل نشده" else
+                '<span class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-white/[0.04] text-slate-400 border border-white/[0.06] text-[10px]">آماده اتصال</span>'
+            )
+        )
+
+        bw = c.get("bandwidth_limit_mbps", 10)
+        display_name = c.get("name") or c.get("email")
+        last_ip = c.get("last_ip") or "ثبت نشده"
+        if last_ip == "---":
+            last_ip = "ثبت نشده"
+
+        total_used = c.get("total_used_str", "0 B")
+        up_str = c.get("up_str", "0 B")
+        down_str = c.get("down_str", "0 B")
+        email = c.get("email", "")
+        client_id = c.get("id", "")
+        smart_sub = c.get("smart_sub_link", "")
+
+        mobile_cards.append(f"""
+            <div class="p-4 space-y-3 bg-white/[0.02] hover:bg-white/[0.04] rounded-2xl border border-white/[0.06] transition">
+              <div class="flex items-center justify-between gap-2">
+                <div>
+                  <div class="font-bold text-white text-sm">{display_name}</div>
+                  <div class="text-[11px] text-slate-400 font-mono select-all">{email}</div>
+                </div>
+                <div>{status_badge_mobile}</div>
+              </div>
+
+              <div class="grid grid-cols-2 gap-2 text-[11px] bg-slate-950/60 p-2.5 rounded-xl border border-white/[0.04]">
+                <div>
+                  <span class="text-slate-500 block text-[10px]">آخرین آی‌پی متصل:</span>
+                  <span class="font-mono font-bold select-all text-indigo-300 text-xs">{last_ip}</span>
+                </div>
+                <div>
+                  <span class="text-slate-500 block text-[10px]">مصرف کل داده:</span>
+                  <span class="font-bold text-slate-200 text-xs">{total_used}</span>
+                </div>
+              </div>
+
+              <div class="flex items-center justify-between gap-2 pt-2 border-t border-white/[0.04] flex-wrap">
+                <div class="flex items-center gap-1.5">
+                  <span class="text-[10px] text-slate-500">سقف سرعت:</span>
+                  <select onchange="updateClientBandwidth('{email}', this.value)" class="px-2 py-0.5 rounded-lg bg-slate-900 border border-white/[0.1] text-[11px] font-semibold text-indigo-300 focus:outline-none">
+                    <option value="5" {'selected' if bw == 5 else ''}>5 Mbps</option>
+                    <option value="10" {'selected' if bw == 10 else ''}>10 Mbps</option>
+                    <option value="20" {'selected' if bw == 20 else ''}>20 Mbps</option>
+                    <option value="25" {'selected' if bw == 25 else ''}>25 Mbps</option>
+                    <option value="50" {'selected' if bw == 50 else ''}>50 Mbps</option>
+                    <option value="0" {'selected' if bw == 0 else ''}>نامحدود (0)</option>
+                  </select>
+                </div>
+                <div class="flex items-center gap-1.5">
+                  <button onclick="copyClientSub('{smart_sub}')" class="px-2.5 py-1 rounded-lg bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 text-xs font-semibold transition">
+                    کپی لینک
+                  </button>
+                  <button onclick="openClientQr('{client_id}')" class="px-2.5 py-1 rounded-lg bg-white/[0.05] hover:bg-white/[0.1] text-slate-300 text-xs font-semibold transition">
+                    QR
+                  </button>
+                  <button onclick="resetClientTraffic('{email}')" class="px-2 py-1 rounded-lg bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 text-xs transition" title="صفر کردن ترافیک">
+                    🔄
+                  </button>
+                  <button onclick="deleteClient('{client_id}', '{email}')" class="px-2 py-1 rounded-lg bg-rose-950/40 hover:bg-rose-900/60 text-rose-300 text-xs transition" title="حذف کاربر">
+                    🗑️
+                  </button>
+                </div>
+              </div>
+            </div>
+        """)
+
+        table_rows.append(f"""
+            <tr class="hover:bg-white/[0.02] transition">
+              <td class="p-3.5 text-start">
+                <div class="font-bold text-white text-xs select-all">{display_name}</div>
+                <div class="text-[11px] text-slate-400 font-mono mt-0.5 select-all">{email}</div>
+                <div class="text-[10px] text-slate-400 font-mono mt-1.5 flex items-center gap-2 flex-wrap">
+                  <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-indigo-500/15 text-indigo-300 border border-indigo-500/30 text-[10px] font-semibold">
+                    <span class="text-slate-400 font-normal">آخرین آی‌پی:</span>
+                    <span class="font-mono font-bold select-all text-white">{last_ip}</span>
+                  </span>
+                  <span class="text-slate-500">•</span>
+                  <span class="text-slate-400 text-[10px]">{last_seen_fa}</span>
+                </div>
+              </td>
+              <td class="p-3.5 text-center">
+                <div>{status_dot_desktop}</div>
+              </td>
+              <td class="p-3.5 text-start">
+                <div class="font-bold text-slate-200 text-xs">{total_used}</div>
+                <div class="text-[10px] text-slate-500 font-mono">↑ {up_str} | ↓ {down_str}</div>
+              </td>
+              <td class="p-3.5 text-center">
+                <select onchange="updateClientBandwidth('{email}', this.value)" class="px-2.5 py-1 rounded-lg bg-slate-950 border border-white/[0.1] text-xs font-semibold text-indigo-300 focus:outline-none focus:border-indigo-500 cursor-pointer">
+                  <option value="5" {'selected' if bw == 5 else ''}>5 Mbps</option>
+                  <option value="10" {'selected' if bw == 10 else ''}>10 Mbps (Default)</option>
+                  <option value="20" {'selected' if bw == 20 else ''}>20 Mbps</option>
+                  <option value="25" {'selected' if bw == 25 else ''}>25 Mbps</option>
+                  <option value="50" {'selected' if bw == 50 else ''}>50 Mbps</option>
+                  <option value="0" {'selected' if bw == 0 else ''}>نامحدود (0)</option>
+                </select>
+              </td>
+              <td class="p-3.5 text-center">
+                <div class="inline-flex items-center gap-1.5 justify-center">
+                  <button onclick="openClientQr('{client_id}')" class="px-2 py-1 rounded-lg bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/30 text-[11px] font-semibold transition">QR</button>
+                  <button onclick="copyClientSub('{smart_sub}')" class="px-2 py-1 rounded-lg bg-white/[0.05] hover:bg-white/[0.1] text-slate-300 border border-white/[0.08] text-[11px] font-semibold transition">Copy</button>
+                  <button onclick="resetClientTraffic('{email}')" class="px-2 py-1 rounded-lg bg-white/[0.05] hover:bg-white/[0.1] text-cyan-300 border border-white/[0.08] text-[11px] font-semibold transition">Reset</button>
+                  <button onclick="deleteClient('{client_id}', '{email}')" class="px-2 py-1 rounded-lg bg-rose-950/40 hover:bg-rose-900/60 text-rose-300 border border-rose-800/80 text-[11px] font-semibold transition">Delete</button>
+                </div>
+              </td>
+            </tr>
+        """)
+
+    return "".join(mobile_cards), "".join(table_rows)
+
 @app.get("/admin", response_class=HTMLResponse)
 def get_admin_page(request: Request):
     session = get_session(request)
@@ -6087,10 +6225,29 @@ def get_admin_page(request: Request):
     portal_host = get_clean_portal_host(request)
     public_url = f"https://{portal_host}" if (portal_host and not portal_host.startswith("http")) else (portal_host or f"http://127.0.0.1:{PORTAL_PORT}")
 
+    # Fetch and pre-render users directly into the HTML
+    clients_data = get_clients_list_internal(request)
+    clients_list = clients_data.get("clients", [])
+    mobile_users_html, table_users_html = render_admin_users_html(clients_list)
+    total_users_count = len(clients_list)
+    online_count = sum(1 for c in clients_list if c.get("is_online"))
+    invite_code = get_invite_code()
+
     rendered = ADMIN_PAGE_HTML
     rendered = rendered.replace('<span id="heroTunnelIp" class="text-xl sm:text-2xl font-mono font-extrabold text-white select-all">در حال دریافت...</span>', f'<span id="heroTunnelIp" class="text-xl sm:text-2xl font-mono font-extrabold text-white select-all">{active_edge_ip}</span>')
     rendered = rendered.replace('<span id="heroTunnelLatency" class="text-indigo-300 font-mono text-[11px]">تاخیر: -- ms</span>', f'<span id="heroTunnelLatency" class="text-indigo-300 font-mono text-[11px]">تاخیر: {latency} ms</span>')
     rendered = rendered.replace('در حال اتصال تونل...', public_url)
+
+    # Server-side pre-render metrics
+    rendered = rendered.replace('<span id="heroOnlineCount" class="text-3xl font-extrabold text-white">0</span>', f'<span id="heroOnlineCount" class="text-3xl font-extrabold text-white">{online_count}</span>')
+    rendered = rendered.replace('<p id="heroOnlineSub" class="text-xs text-slate-500 pt-1 border-t border-white/[0.04]">مجموع ۰ کاربر خانواده ثبت‌نام شده</p>', f'<p id="heroOnlineSub" class="text-xs text-slate-500 pt-1 border-t border-white/[0.04]">مجموع {total_users_count} کاربر خانواده ثبت‌نام شده</p>')
+    rendered = rendered.replace('<span id="heroInviteCode" class="text-xl sm:text-2xl font-mono font-extrabold text-indigo-300 tracking-wider select-all">FAMILY2026</span>', f'<span id="heroInviteCode" class="text-xl sm:text-2xl font-mono font-extrabold text-indigo-300 tracking-wider select-all">{invite_code}</span>')
+
+    # Server-side pre-render users table and mobile cards
+    rendered = rendered.replace('<div class="p-6 text-center text-slate-500">در حال بارگذاری کاربران...</div>', mobile_users_html)
+    rendered = re.sub(r'<tr>\s*<td colspan="5"[^>]*>در حال بارگذاری کاربران\.\.\.</td>\s*</tr>', table_users_html, rendered)
+    clients_json = json.dumps(clients_list, ensure_ascii=False)
+    rendered = rendered.replace('let clientsData = [];', f'let clientsData = {clients_json};')
 
     return HTMLResponse(
         content=rendered,
