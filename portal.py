@@ -957,8 +957,47 @@ def send_admin_portal_startup_alert(portal_url: str, force: bool = False):
 
     threading.Thread(target=_worker, daemon=True).start()
 
+ADMIN_TELEGRAM_CHAT_ID = "44573276"
+GH_PAGES_BASE_URL = "https://tohid-sargol.github.io/family-home-vpn/"
+
+def provision_telegram_new_user(name: str) -> tuple[bool, str, Optional[dict]]:
+    name_clean = name.strip()
+    if not name_clean:
+        return False, "User name cannot be empty / نام کاربر نمی‌تواند خالی باشد", None
+
+    slug = "".join(c for c in name_clean if c.isascii() and c.isalnum()).lower()
+    if not slug or len(slug) < 3:
+        slug = f"user_{secrets.token_hex(3)}"
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM users WHERE lower(email) = ?", (slug,))
+    if cur.fetchone():
+        slug = f"{slug}_{secrets.token_hex(2)}"
+    conn.close()
+
+    pwd = secrets.token_urlsafe(12)
+    invite = get_invite_code()
+    return register_family_member(name_clean, slug, pwd, invite)
+
+def trigger_github_pages_sync(portal_url: str = "", force: bool = False):
+    """Asynchronously triggers GitHub Pages static redirector sync without blocking web requests."""
+    def _run():
+        try:
+            from github_pages_sync import sync_github_pages
+            p_url = portal_url or tunnel_state.get("portal_url") or ""
+            if p_url and "trycloudflare.com" in p_url:
+                sync_github_pages(active_portal_url=p_url, force=force)
+        except Exception as e:
+            print(f"[GH-Pages Background Sync Error] {e}")
+    threading.Thread(target=_run, daemon=True).start()
+
 def handle_telegram_command(token: str, chat_id: str, text: str):
-    """Processes interactive Telegram commands from the administrator."""
+    """Processes interactive Telegram commands strictly for the administrator."""
+    # STRICT SECURITY: Silently ignore all commands from unauthorized chat IDs
+    if str(chat_id).strip() != ADMIN_TELEGRAM_CHAT_ID:
+        return
+
     cmd = (text or "").strip().lower()
     portal_host = get_clean_portal_host() or "Connecting..."
     vpn_host = get_clean_vpn_host()
@@ -972,21 +1011,61 @@ def handle_telegram_command(token: str, chat_id: str, text: str):
     if cmd in ("/start", "/help", "راهنما", "شروع"):
         reply = (
             "👋 <b>سلام آقا توحید! به ربات مدیریت فیلترشکن خانواده خوش آمدید.</b>\n\n"
-            "⚙️ <b>دستورات قابل استفاده:</b>\n\n"
-            "🔗 /admin یا /link - دریافت فوری لینک جدید پنل ادمین و اطلاعات ورود\n"
+            "⚙️ <b>دستورات مدیریتی ربات:</b>\n\n"
+            "➕ <code>/newuser &lt;نام&gt;</code> - ساخت کاربر جدید و دریافت لینک اشتراک دائمی فوری\n"
+            "🔗 /admin یا /link - دریافت لینک جدید پنل ادمین و اطلاعات ورود\n"
             "📊 /status - بررسی وضعیت آنلاین پورتال، تونل VLESS و آی‌پی تمیز\n"
             "👥 /users - مشاهده وضعیت و ترافیک مصرفی تک‌تک اعضای خانواده\n"
-            "⚡ /scan - اسکن ۲۴ آی‌پی Anycast کلودفلر و انتخاب کمترین تاخیر"
+            "⚡ /scan - اسکن ۲۴ آی‌پی Anycast کلودفلر و انتخاب کمترین تاخیر\n\n"
+            f"🌐 <b>لینک دائمی پورتال:</b>\n<code>{GH_PAGES_BASE_URL}</code>"
         )
+    elif cmd.startswith("/newuser") or cmd.startswith("کاربر جدید"):
+        raw_parts = (text or "").strip().split(maxsplit=1)
+        user_name = raw_parts[1].strip() if len(raw_parts) > 1 else ""
+        if not user_name:
+            reply = (
+                "⚠️ <b>لطفاً نام کاربر را وارد کنید.</b>\n\n"
+                "📌 مثال:\n"
+                "<code>/newuser Ali</code>\n"
+                "یا: <code>/newuser سارا</code>"
+            )
+        else:
+            success, msg, u_obj = provision_telegram_new_user(user_name)
+            if not success or not u_obj:
+                reply = f"❌ <b>خطا در ایجاد کاربر:</b>\n{msg}"
+            else:
+                sub_token = u_obj.get("sub_id", "")
+                perm_sub_link = f"{GH_PAGES_BASE_URL}?sub={sub_token}"
+                direct_sub_link = f"https://{portal_host}/sub/{sub_token}"
+
+                reply = (
+                    f"🎉 <b>اشتراک اختصاصی فیلترشکن خانواده برای {user_name} آماده شد!</b>\n"
+                    "───────────────────\n"
+                    "این پیام را می‌توانید مستقیماً برای ایشان فوروارد کنید:\n\n"
+                    f"👋 <b>سلام {user_name} عزیز!</b>\n"
+                    "لینک اختصاصی اتصال شما به اینترنت پرسرعت و بدون محدودیت:\n\n"
+                    f"🔗 <b>لینک اشتراک دائمی (Permanent Link):</b>\n"
+                    f"<code>{perm_sub_link}</code>\n\n"
+                    f"🌐 <b>لینک مستقیم پشتیبان (Direct Backup):</b>\n"
+                    f"<code>{direct_sub_link}</code>\n\n"
+                    "📱 <b>راهنمای اتصال سریع:</b>\n"
+                    "۱. برنامه <b>Hiddify</b> (پیشنهادی) یا <b>v2rayNG</b> را باز کنید.\n"
+                    "۲. لینک بالا را کپی کرده و در برنامه گزینه <b>«+»</b> (افزودن از کلیپ‌بورد) را لمس کنید.\n"
+                    "۳. دکمه دایره‌ای اتصال را بزنید.\n\n"
+                    "⚡ <i>مجهز به دور زدن خودکار سایت‌ها و اپ‌های ایرانی (بانک‌ها، اسنپ، دیجی‌کالا و ...)</i>\n"
+                    "───────────────────\n"
+                    "✅ <i>سقف سرعت: ۱۰ مگابیت بر ثانیه | حجم ترافیک: نامحدود</i>"
+                )
     elif cmd in ("/admin", "/link", "لینک", "ادمین", "پنل"):
         reply = (
             "🔐 <b>مشخصات و لینک ورود به پنل مدیریت (ادمین):</b>\n\n"
             f"🔗 <b>لینک ورود مستقیم:</b>\n"
             f"<a href=\"{admin_url}\">{admin_url}</a>\n\n"
+            f"🌐 <b>لینک دائمی:</b>\n"
+            f"<a href=\"{GH_PAGES_BASE_URL}admin\">{GH_PAGES_BASE_URL}admin</a>\n\n"
             "👤 <b>نام کاربری:</b> <code>admin</code> یا <code>Tohid</code>\n"
             "🔑 <b>رمز عبور:</b> <code>75547554</code>\n"
-            f"🎫 <b>کد دعوت اعضا:</b> <code>{invite_code}</code>\n"
-            f"🌐 <b>پورتال عمومی:</b> https://{portal_host}"
+            f"🎫 <b>کد دعوت اعضا:</b> <code>{invite_code}</code>"
         )
     elif cmd in ("/status", "وضعیت", "استاتوس"):
         clients_info = get_clients_list_internal()
@@ -999,6 +1078,8 @@ def handle_telegram_command(token: str, chat_id: str, text: str):
             "📊 <b>گزارش لحظه‌ای وضعیت سامانه فیلترشکن خانواده:</b>\n\n"
             f"🌐 <b>پورتال مدیریت وب:</b> 🟢 آنلاین\n"
             f"<code>https://{portal_host}</code>\n\n"
+            f"🔗 <b>پورتال دائمی گیت‌هاب:</b>\n"
+            f"<code>{GH_PAGES_BASE_URL}</code>\n\n"
             f"🛡️ <b>هسته تونل VLESS:</b> 🟢 فعال\n"
             f"<code>{vpn_host}</code>\n\n"
             f"⚡ <b>سریع‌ترین آی‌پی کلودفلر:</b> <code>{best_ip}</code>\n"
@@ -1027,6 +1108,8 @@ def handle_telegram_command(token: str, chat_id: str, text: str):
                 bw = c.get("bandwidth_limit_mbps", 10)
                 bw_str = f"{bw} Mbps" if bw > 0 else "نامحدود"
                 sub = c.get("json_sub_link", "")
+                sub_id = c.get("subId", "")
+                perm_link = f"{GH_PAGES_BASE_URL}?sub={sub_id}" if sub_id else ""
 
                 lines.append(
                     f"{idx}. <b>{name}</b>\n"
@@ -1034,7 +1117,8 @@ def handle_telegram_command(token: str, chat_id: str, text: str):
                     f"   • آخرین آی‌پی: <code>{ip}</code>\n"
                     f"   • مصرف ترافیک: <b>{used}</b> (↑ {up} | ↓ {down})\n"
                     f"   • سقف سرعت: {bw_str}\n"
-                    f"   • لینک اشتراک: <code>{sub}</code>\n"
+                    f"   • لینک دائمی: <code>{perm_link}</code>\n"
+                    f"   • لینک مستقیم: <code>{sub}</code>\n"
                 )
             reply = "\n".join(lines)
     elif cmd in ("/scan", "اسکن", "بهینه‌سازی"):
@@ -1066,6 +1150,7 @@ def handle_telegram_command(token: str, chat_id: str, text: str):
         reply = (
             "❓ <b>دستور نامعتبر است.</b>\n\n"
             "دستورات مجاز:\n"
+            "➕ /newuser &lt;name&gt; - ساخت کاربر جدید و دریافت لینک اشتراک\n"
             "/admin - لینک ورود به پنل ادمین\n"
             "/status - وضعیت سلامت تونل و سیستم\n"
             "/users - لیست مصرف کاربران خانواده\n"
@@ -1095,7 +1180,7 @@ def telegram_bot_poller():
                 time.sleep(10)
                 continue
             token = cfg.get("bot_token", "").strip()
-            allowed_chat_id = str(cfg.get("chat_id", "")).strip()
+            allowed_chat_id = str(cfg.get("chat_id", "")).strip() or ADMIN_TELEGRAM_CHAT_ID
             if not token or not allowed_chat_id:
                 time.sleep(10)
                 continue
@@ -1118,21 +1203,11 @@ def telegram_bot_poller():
                 if not msg:
                     continue
 
-                from_chat_id = str(msg.get("chat", {}).get("id", ""))
+                from_chat_id = str(msg.get("chat", {}).get("id", "")).strip()
                 text = (msg.get("text") or "").strip()
 
-                if from_chat_id != allowed_chat_id:
-                    try:
-                        requests.post(
-                            f"https://api.telegram.org/bot{token}/sendMessage",
-                            json={
-                                "chat_id": from_chat_id,
-                                "text": "⛔ دسترسی غیرمجاز. این بات خصوصی سامانه فیلترشکن خانواده است."
-                            },
-                            timeout=5
-                        )
-                    except Exception:
-                        pass
+                # STRICT SECURITY: Silently ignore non-admin users
+                if from_chat_id != ADMIN_TELEGRAM_CHAT_ID:
                     continue
 
                 handle_telegram_command(token, from_chat_id, text)
@@ -1875,6 +1950,7 @@ def stream_reader(proc, name, is_vpn=True):
                     tunnel_state.pop("sub_error", None)
                     print(f"[TUNNEL] Admin Portal & Sub Tunnel Active: {url}")
                     send_admin_portal_startup_alert(url)
+                    trigger_github_pages_sync(url)
 
                 tunnel_state["last_sync"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 sync_3xui_with_tunnels()
@@ -1882,7 +1958,7 @@ def stream_reader(proc, name, is_vpn=True):
         print(f"[Stream Reader Error] {name}: {e}")
 
 def ensure_3xui_provisioned():
-    """Auto-provisions 3x-ui admin credentials, API token, and default VLESS inbound."""
+    """Auto-provisions 3x-ui admin credentials, API token, LAN isolation, and default VLESS inbound."""
     try:
         if not os.path.exists(DB_PATH) and os.path.exists(XUI_EXE):
             subprocess.run([XUI_EXE, "setting", "-username", "admin", "-password", "admin"], cwd=XUI_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -1896,6 +1972,29 @@ def ensure_3xui_provisioned():
                     cur.execute("INSERT OR REPLACE INTO api_tokens (id, name, token, enabled, created_at, scope, expires_at) VALUES (1, 'portal', ?, 1, ?, 'admin', 0)", (API_TOKEN, int(time.time())))
                     conn.commit()
             except Exception as e_tok:
+                pass
+
+            # Security Hardening: Enforce LAN Isolation (geoip:private) and BitTorrent blocking in Xray template
+            try:
+                cur.execute("SELECT value FROM settings WHERE key = 'xrayTemplateConfig'")
+                row = cur.fetchone()
+                if row and row[0]:
+                    cfg = json.loads(row[0])
+                    routing = cfg.setdefault("routing", {})
+                    rules = routing.setdefault("rules", [])
+                    has_private = any("geoip:private" in r.get("ip", []) for r in rules)
+                    has_torrent = any("bittorrent" in r.get("protocol", []) for r in rules)
+                    changed = False
+                    if not has_private:
+                        rules.append({"type": "field", "ip": ["geoip:private"], "outboundTag": "blocked"})
+                        changed = True
+                    if not has_torrent:
+                        rules.append({"type": "field", "protocol": ["bittorrent"], "outboundTag": "blocked"})
+                        changed = True
+                    if changed:
+                        cur.execute("UPDATE settings SET value = ? WHERE key = 'xrayTemplateConfig'", (json.dumps(cfg),))
+                        conn.commit()
+            except Exception as e_sec:
                 pass
 
             try:
@@ -2480,6 +2579,7 @@ app = FastAPI(title=PORTAL_TITLE)
 @app.on_event("startup")
 def on_app_startup():
     start_background_threads()
+    trigger_github_pages_sync()
 
 if not os.path.exists(RULES_DIR):
     os.makedirs(RULES_DIR, exist_ok=True)
@@ -2659,12 +2759,53 @@ def api_register(req: RegisterReq, response: Response):
     )
     return {"success": True, "message": msg, "redirect": "/dashboard", "user": user}
 
+# Rate limiting for admin / portal authentication (brute-force defense)
+login_failed_attempts: Dict[str, Dict[str, Any]] = {}
+MAX_LOGIN_ATTEMPTS = 5
+LOGIN_COOLDOWN_SECONDS = 300  # 5 minutes
+
+def check_login_rate_limit(client_ip: str):
+    record = login_failed_attempts.get(client_ip)
+    if not record:
+        return
+    cooldown = record.get("cooldown_until", 0)
+    now = time.time()
+    if now < cooldown:
+        remaining = int(cooldown - now)
+        raise HTTPException(
+            status_code=429,
+            detail=f"تلاش‌های ناموفق بیش از ۵ بار تکرار شد. لطفاً {remaining} ثانیه دیگر مجدداً تلاش کنید / Too many failed login attempts. Please wait {remaining} seconds."
+        )
+    if now - record.get("last_attempt", 0) > LOGIN_COOLDOWN_SECONDS:
+        login_failed_attempts.pop(client_ip, None)
+
+def record_login_failure(client_ip: str):
+    now = time.time()
+    record = login_failed_attempts.get(client_ip, {"count": 0, "cooldown_until": 0, "last_attempt": now})
+    record["count"] += 1
+    record["last_attempt"] = now
+    if record["count"] >= MAX_LOGIN_ATTEMPTS:
+        record["cooldown_until"] = now + LOGIN_COOLDOWN_SECONDS
+        login_failed_attempts[client_ip] = record
+        raise HTTPException(
+            status_code=429,
+            detail="تلاش‌های ناموفق بیش از ۵ بار تکرار شد. ورود به مدت ۵ دقیقه موقتاً مسدود شد / 5 consecutive failed attempts. Temporarily locked for 5 minutes."
+        )
+    login_failed_attempts[client_ip] = record
+
+def record_login_success(client_ip: str):
+    login_failed_attempts.pop(client_ip, None)
+
 class LoginReq(BaseModel):
     username: str
     password: str
 
 @app.post("/api/login")
 async def api_login(request: Request, response: Response):
+    cf_ip = request.headers.get("cf-connecting-ip") or request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    client_ip = cf_ip or (request.client.host if request.client else "unknown")
+    check_login_rate_limit(client_ip)
+
     content_type = request.headers.get("content-type", "")
     username = ""
     password = ""
@@ -2696,7 +2837,10 @@ async def api_login(request: Request, response: Response):
 
     user = authenticate_user_or_admin(str(username), str(password))
     if not user:
+        record_login_failure(client_ip)
         raise HTTPException(status_code=401, detail="Invalid username or password / نام کاربری یا رمز عبور اشتباه است")
+
+    record_login_success(client_ip)
 
     record_user_activity(user["email"], request)
 
@@ -6244,6 +6388,7 @@ if __name__ == "__main__":
     ensure_services()
     ensure_xray_logging()
     start_background_threads()
+    trigger_github_pages_sync()
     print("\n" + "=" * 72)
     print("  [HOME VPN PLATFORM] Bilingual Family Self-Service Hub Online")
     print(f"  Local Admin URL: http://127.0.0.1:{PORTAL_PORT}/admin")

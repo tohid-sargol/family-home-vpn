@@ -8,6 +8,7 @@ admin_auth.json
 telegram_config.json
 config.json
 !config.json.template
+gh_pages_sync_state.json
 
 # Python cache & virtual environments
 __pycache__/
