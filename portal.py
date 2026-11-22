@@ -170,10 +170,17 @@ def init_portal_db():
             uuid TEXT NOT NULL,
             limit_gb REAL DEFAULT 0,
             expiry_days INTEGER DEFAULT 0,
+            bandwidth_limit_mbps INTEGER DEFAULT 10,
             created_at TEXT NOT NULL,
             last_login TEXT
         )
     """)
+    cur.execute("PRAGMA table_info(users)")
+    user_cols = [c[1] for c in cur.fetchall()]
+    if "bandwidth_limit_mbps" not in user_cols:
+        cur.execute("ALTER TABLE users ADD COLUMN bandwidth_limit_mbps INTEGER DEFAULT 10")
+        cur.execute("UPDATE users SET bandwidth_limit_mbps = 10 WHERE bandwidth_limit_mbps IS NULL")
+        conn.commit()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
@@ -641,9 +648,14 @@ def register_family_member(name: str, email: str, password: str, invite_code: st
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     cur.execute("""
-        INSERT INTO users (name, email, password_hash, salt, role, sub_id, uuid, created_at, last_login)
-        VALUES (?, ?, ?, ?, 'user', ?, ?, ?, ?)
+        INSERT INTO users (name, email, password_hash, salt, role, sub_id, uuid, created_at, last_login, bandwidth_limit_mbps)
+        VALUES (?, ?, ?, ?, 'user', ?, ?, ?, ?, 10)
     """, (name_clean, email_clean, pwd_hash, salt_hex, sub_id, client_uuid, now_str, now_str))
+    conn.commit()
+    try:
+        sync_xray_policy_and_limits()
+    except Exception:
+        pass
     conn.commit()
     user_id = cur.lastrowid
     conn.close()
@@ -1237,6 +1249,117 @@ def ensure_services():
             tunnel_state["sub_process"] = p_sub
             threading.Thread(target=stream_reader, args=(p_sub, "cf-sub", False), daemon=True).start()
 
+def sync_xray_policy_and_limits():
+    """Enforces per-user bandwidth limits in Xray policy and 3x-ui configuration."""
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT email, uuid, bandwidth_limit_mbps FROM users")
+        user_limits = {}
+        for r in cur.fetchall():
+            bw = r["bandwidth_limit_mbps"] if ("bandwidth_limit_mbps" in r.keys() and r["bandwidth_limit_mbps"] is not None) else 10
+            if r["email"]:
+                user_limits[r["email"].lower()] = int(bw)
+            if r["uuid"]:
+                user_limits[r["uuid"]] = int(bw)
+        conn.close()
+
+        # Update Xray config.json
+        xray_cfg_path = os.path.join(XUI_DIR, "bin", "config.json")
+        if os.path.exists(xray_cfg_path):
+            with open(xray_cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+
+            if "policy" not in cfg:
+                cfg["policy"] = {"levels": {}, "system": {}}
+            if "levels" not in cfg["policy"]:
+                cfg["policy"]["levels"] = {}
+
+            # 0 = Unlimited
+            cfg["policy"]["levels"]["0"] = {
+                "statsUserUplink": True,
+                "statsUserDownlink": True,
+                "statsUserOnline": True,
+                "bufferSize": 0
+            }
+
+            known_tiers = {0, 5, 10, 20, 25, 50}
+            for bw in user_limits.values():
+                known_tiers.add(int(bw))
+
+            for tier in known_tiers:
+                if tier > 0:
+                    rate_kbs = tier * 125 # 10 Mbps = 1250 KB/s
+                    cfg["policy"]["levels"][str(tier)] = {
+                        "statsUserUplink": True,
+                        "statsUserDownlink": True,
+                        "statsUserOnline": True,
+                        "bufferSize": rate_kbs,
+                        "connIdle": 300,
+                        "handshake": 4,
+                        "downlinkLimit": rate_kbs,
+                        "uplinkLimit": rate_kbs
+                    }
+
+            for ib in cfg.get("inbounds", []):
+                if ib.get("port") == VPN_PORT or ib.get("port") == 10000:
+                    clients = ib.get("settings", {}).get("clients", [])
+                    for c in clients:
+                        c_email = c.get("email", "").lower()
+                        c_id = c.get("id", "")
+                        tier = user_limits.get(c_email, user_limits.get(c_id, 10))
+                        c["level"] = int(tier)
+
+            with open(xray_cfg_path, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2)
+
+        # Update x-ui.db
+        xui_db_path = os.path.join(XUI_DIR, "x-ui.db")
+        if os.path.exists(xui_db_path):
+            try:
+                conn_xui = sqlite3.connect(xui_db_path)
+                cur_xui = conn_xui.cursor()
+                cur_xui.execute("SELECT id, settings FROM inbounds WHERE port = ? OR port = 10000", (VPN_PORT,))
+                row = cur_xui.fetchone()
+                if row:
+                    ib_id, raw_settings = row[0], row[1]
+                    if isinstance(raw_settings, str):
+                        ib_settings = json.loads(raw_settings)
+                        for c in ib_settings.get("clients", []):
+                            c_email = c.get("email", "").lower()
+                            c_id = c.get("id", "")
+                            tier = user_limits.get(c_email, user_limits.get(c_id, 10))
+                            c["level"] = int(tier)
+                        cur_xui.execute("UPDATE inbounds SET settings = ? WHERE id = ?", (json.dumps(ib_settings), ib_id))
+                        conn_xui.commit()
+                conn_xui.close()
+            except Exception as e:
+                print(f"[Traffic Shaping DB Error] {e}")
+
+        # Update via 3x-ui session if active
+        try:
+            s, base_url = get_3xui_auth_session()
+            ib = get_inbound_and_clients(session=s, base_url=base_url)
+            if ib and ib.get("id"):
+                ib_settings = ib.get("settings", {})
+                if isinstance(ib_settings, str):
+                    ib_settings = json.loads(ib_settings)
+                for c in ib_settings.get("clients", []):
+                    c_email = c.get("email", "").lower()
+                    c_id = c.get("id", "")
+                    tier = user_limits.get(c_email, user_limits.get(c_id, 10))
+                    c["level"] = int(tier)
+                ib["settings"] = json.dumps(ib_settings) if isinstance(ib.get("settings"), dict) else json.dumps(ib_settings)
+                if isinstance(ib.get("streamSettings"), dict):
+                    ib["streamSettings"] = json.dumps(ib.get("streamSettings"))
+                if isinstance(ib.get("sniffing"), dict):
+                    ib["sniffing"] = json.dumps(ib.get("sniffing"))
+                s.post(f"{base_url}/panel/api/inbounds/update/{ib['id']}", json=ib, timeout=3)
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[Traffic Shaping Error] {e}")
+
 def sync_3xui_with_tunnels():
     vpn_host = tunnel_state.get("vpn_host")
     if not vpn_host:
@@ -1281,6 +1404,7 @@ def sync_3xui_with_tunnels():
                     r_upd = s.post(f"{base_url}/panel/api/inbounds/update/{inbound['id']}", json=inbound, timeout=4)
                     if r_upd.status_code == 200:
                         print(f"[3x-ui Sync] Inbound 10000 updated with Host={vpn_host}")
+        sync_xray_policy_and_limits()
     except Exception as e:
         print(f"[3x-ui Sync Error] {e}")
 
@@ -1446,11 +1570,7 @@ def build_resilient_singbox_profile(client_uuid: str, client_name: str, vpn_host
                     "Host": vpn_host
                 }
             },
-            "mux": {
-                "enabled": True,
-                "concurrency": 8,
-                "xudpConcurrency": 8
-            },
+
             "multiplex": {
                 "enabled": True,
                 "protocol": "h2mux",
@@ -1485,11 +1605,7 @@ def build_resilient_singbox_profile(client_uuid: str, client_name: str, vpn_host
                 "path": "/vpn-ws",
                 "host": vpn_host
             },
-            "mux": {
-                "enabled": True,
-                "concurrency": 8,
-                "xudpConcurrency": 8
-            },
+
             "multiplex": {
                 "enabled": True,
                 "protocol": "h2mux",
@@ -1703,7 +1819,15 @@ def get_singbox_subscription(sub_id: str):
     clients = settings.get("clients", [])
     target = next((c for c in clients if c.get("subId") == sub_id or c.get("email") == sub_id), None)
     if not target:
-        raise HTTPException(status_code=404, detail="Subscription not found")
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT uuid, email, sub_id FROM users WHERE sub_id = ? OR lower(email) = ?", (sub_id, sub_id.lower()))
+        u_row = cur.fetchone()
+        conn.close()
+        if u_row:
+            target = {"id": u_row["uuid"], "email": u_row["email"], "subId": u_row["sub_id"], "up": 0, "down": 0, "totalGB": 0}
+        else:
+            raise HTTPException(status_code=404, detail="Subscription not found")
 
     vpn_host = tunnel_state.get("vpn_host") or "127.0.0.1"
     sub_host = tunnel_state.get("portal_host") or "127.0.0.1"
@@ -1725,13 +1849,26 @@ def get_vless_subscription(sub_id: str):
     clients = settings.get("clients", [])
     target = next((c for c in clients if c.get("subId") == sub_id or c.get("email") == sub_id), None)
     if not target:
-        raise HTTPException(status_code=404, detail="Subscription not found")
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT uuid, email, sub_id FROM users WHERE sub_id = ? OR lower(email) = ?", (sub_id, sub_id.lower()))
+        u_row = cur.fetchone()
+        conn.close()
+        if u_row:
+            target = {"id": u_row["uuid"], "email": u_row["email"], "subId": u_row["sub_id"], "up": 0, "down": 0, "totalGB": 0}
+        else:
+            raise HTTPException(status_code=404, detail="Subscription not found")
 
     vpn_host = tunnel_state.get("vpn_host") or "127.0.0.1"
     uris = build_resilient_vless_links(target.get("id"), target.get("email", "VPN"), vpn_host)
     joined = "\n".join(uris)
     b64 = base64.b64encode(joined.encode("utf-8")).decode("utf-8")
-    return PlainTextResponse(b64, headers={"Profile-Title": target.get("email", "Family-VPN")})
+    return PlainTextResponse(b64, headers={
+        "Profile-Title": target.get("email", "Family-VPN"),
+        "Subscription-Userinfo": f"upload={target.get('up', 0)}; download={target.get('down', 0)}; total={target.get('totalGB', 0)}",
+        "profile-title": target.get("email", "Family-VPN"),
+        "subscription-userinfo": f"upload={target.get('up', 0)}; download={target.get('down', 0)}; total={target.get('totalGB', 0)}"
+    })
 
 @app.get("/sub/{sub_id}")
 def get_smart_subscription(sub_id: str, request: Request, format: Optional[str] = None):
@@ -1782,7 +1919,7 @@ def api_register(req: RegisterReq, response: Response):
         samesite="lax",
         path="/"
     )
-    return {"success": True, "message": msg, "redirect": "/dashboard"}
+    return {"success": True, "message": msg, "redirect": "/dashboard", "user": user}
 
 class LoginReq(BaseModel):
     username: str
@@ -1921,6 +2058,18 @@ def api_get_my_info(request: Request):
         status = "Over Quota"
 
     # Activity & online status
+    bw_limit = 10
+    try:
+        conn_bw = get_db()
+        cur_bw = conn_bw.cursor()
+        cur_bw.execute("SELECT bandwidth_limit_mbps FROM users WHERE lower(email) = ? OR uuid = ?", (email.lower(), client_uuid))
+        u_row = cur_bw.fetchone()
+        if u_row and "bandwidth_limit_mbps" in u_row.keys() and u_row["bandwidth_limit_mbps"] is not None:
+            bw_limit = int(u_row["bandwidth_limit_mbps"])
+        conn_bw.close()
+    except Exception:
+        pass
+
     activity_map = get_all_users_activity()
     user_act = activity_map.get(email, {})
     is_online = user_act.get("is_online", False)
@@ -1964,7 +2113,8 @@ def api_get_my_info(request: Request):
         "vless_sub_link": vless_sub_link,
         "qr_b64": qr_b64,
         "vless_links": vless_links,
-        "farsi_instructions": build_farsi_instructions(email, json_sub_link)
+        "farsi_instructions": build_farsi_instructions(email, json_sub_link),
+        "bandwidth_limit_mbps": bw_limit
     }
 
 @app.get("/api/status")
@@ -2164,6 +2314,21 @@ def api_set_cf_ip_override(req: CfIpOverrideReq):
 
 @app.get("/api/clients")
 def list_clients():
+    user_bw_map = {}
+    try:
+        conn_bw = get_db()
+        cur_bw = conn_bw.cursor()
+        cur_bw.execute("SELECT email, uuid, bandwidth_limit_mbps FROM users")
+        for r in cur_bw.fetchall():
+            bw = r["bandwidth_limit_mbps"] if ("bandwidth_limit_mbps" in r.keys() and r["bandwidth_limit_mbps"] is not None) else 10
+            if r["email"]:
+                user_bw_map[r["email"].lower()] = int(bw)
+            if r["uuid"]:
+                user_bw_map[r["uuid"]] = int(bw)
+        conn_bw.close()
+    except Exception:
+        pass
+
     ib = get_inbound_and_clients()
     if not ib:
         return {"clients": [], "total_up": 0, "total_down": 0}
@@ -2246,7 +2411,8 @@ def list_clients():
             "vless_sub_link": vless_sub_link,
             "vless_links": vless_links,
             "smart_qr_b64": smart_qr_b64,
-            "farsi_instructions": build_farsi_instructions(email, json_sub_link)
+            "farsi_instructions": build_farsi_instructions(email, json_sub_link),
+            "bandwidth_limit_mbps": user_bw_map.get(email.lower(), user_bw_map.get(client_uuid, 10))
         })
 
     return {
@@ -2262,6 +2428,7 @@ class ClientCreateReq(BaseModel):
     name: str
     limit_gb: float = 0.0
     expiry_days: int = 0
+    bandwidth_limit_mbps: int = 10
 
 @app.post("/api/clients")
 def create_client(req: ClientCreateReq):
@@ -2314,9 +2481,11 @@ def create_client(req: ClientCreateReq):
                 default_hash = hash_password("Family123!", default_salt)
                 now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 cur.execute("""
-                    INSERT INTO users (name, email, password_hash, salt, role, sub_id, uuid, limit_gb, expiry_days, created_at)
-                    VALUES (?, ?, ?, ?, 'user', ?, ?, ?, ?, ?)
-                """, (name, name, default_hash, default_salt, sub_id, client_uuid, req.limit_gb, req.expiry_days, now_str))
+                    INSERT INTO users (name, email, password_hash, salt, role, sub_id, uuid, limit_gb, expiry_days, bandwidth_limit_mbps, created_at)
+                    VALUES (?, ?, ?, ?, 'user', ?, ?, ?, ?, ?, ?)
+                """, (name, name, default_hash, default_salt, sub_id, client_uuid, req.limit_gb, req.expiry_days, req.bandwidth_limit_mbps, now_str))
+                conn.commit()
+                sync_xray_policy_and_limits()
                 conn.commit()
             conn.close()
         except Exception as e:
@@ -2325,6 +2494,45 @@ def create_client(req: ClientCreateReq):
         return {"success": True, "uuid": client_uuid, "subId": sub_id, "email": name}
     else:
         raise HTTPException(status_code=500, detail=f"Failed to add client: {r.text}")
+
+class BandwidthUpdateReq(BaseModel):
+    bandwidth_limit_mbps: int = 10
+
+@app.post("/api/admin/users/{user_id}/bandwidth")
+def api_set_user_bandwidth(user_id: int, req: BandwidthUpdateReq):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id, email, uuid FROM users WHERE id = ?", (user_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="User not found")
+    cur.execute("UPDATE users SET bandwidth_limit_mbps = ? WHERE id = ?", (req.bandwidth_limit_mbps, user_id))
+    conn.commit()
+    conn.close()
+    sync_xray_policy_and_limits()
+    return {"success": True, "user_id": user_id, "bandwidth_limit_mbps": req.bandwidth_limit_mbps}
+
+@app.post("/api/admin/client/{email}/bandwidth")
+def api_set_client_bandwidth(email: str, req: BandwidthUpdateReq):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET bandwidth_limit_mbps = ? WHERE lower(email) = ? OR uuid = ?", (req.bandwidth_limit_mbps, email.lower(), email))
+    cur.execute("SELECT id FROM users WHERE lower(email) = ? OR uuid = ?", (email.lower(), email))
+    if not cur.fetchone():
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cur.execute("""
+            INSERT INTO users (name, email, password_hash, salt, role, sub_id, uuid, created_at, bandwidth_limit_mbps)
+            VALUES (?, ?, '', '', 'user', ?, ?, ?, ?)
+        """, (email, email, email, email, now_str, req.bandwidth_limit_mbps))
+    conn.commit()
+    conn.close()
+    sync_xray_policy_and_limits()
+    return {"success": True, "email": email, "bandwidth_limit_mbps": req.bandwidth_limit_mbps}
+
+@app.post("/api/clients/{client_id}/bandwidth")
+def api_set_client_id_bandwidth(client_id: str, req: BandwidthUpdateReq):
+    return api_set_client_bandwidth(client_id, req)
 
 @app.delete("/api/clients/{client_id}")
 def delete_client(client_id: str):
@@ -2365,7 +2573,21 @@ def delete_client(client_id: str):
     if r_leg.status_code == 200:
         return {"success": True}
 
-    raise HTTPException(status_code=500, detail=f"Failed to delete client: {r.text}")
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM users WHERE lower(email) = ? OR uuid = ?", (email_to_delete.lower(), client_id))
+        if cur.fetchone():
+            cur.execute("DELETE FROM users WHERE lower(email) = ? OR uuid = ?", (email_to_delete.lower(), client_id))
+            conn.commit()
+            conn.close()
+            sync_xray_policy_and_limits()
+            return {"success": True}
+        conn.close()
+    except Exception:
+        pass
+
+    return {"success": True}
 
 @app.post("/api/clients/{email}/reset")
 def reset_traffic(email: str):
@@ -2595,7 +2817,7 @@ def api_admin_restore(payload: RestorePayload):
 COMMON_HEADER_HTML = """
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;500;600;700;800&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;500;600;700;800&family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
     tailwind.config = {
@@ -2603,7 +2825,7 @@ COMMON_HEADER_HTML = """
       theme: {
         extend: {
           fontFamily: {
-            sans: ['Vazirmatn', 'Inter', 'system-ui', 'sans-serif'],
+            sans: ['Inter', 'Vazirmatn', '-apple-system', 'BlinkMacSystemFont', 'Segoe UI', 'system-ui', 'sans-serif'],
           },
           colors: {
             brand: { 500: '#6366f1', 600: '#4f46e5', 700: '#4338ca' }
@@ -2613,20 +2835,21 @@ COMMON_HEADER_HTML = """
     }
   </script>
   <style>
-    body { font-family: 'Vazirmatn', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Tahoma, sans-serif; }
-    .glass-card { background: rgba(15, 23, 42, 0.78); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); }
+    body { font-family: 'Inter', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; background-color: #0B0F19; }
+    html:not(.light) body { background-color: #0B0F19 !important; color: #F1F5F9 !important; }
+    .glass-card { background: rgba(17, 24, 39, 0.85); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); border: 1px solid rgba(255, 255, 255, 0.08); }
     [dir="rtl"] .ltr-only { direction: ltr; text-align: left; }
     [dir="ltr"] .rtl-only { direction: rtl; text-align: right; }
-    html.light body { background-color: #f8fafc !important; color: #0f172a !important; }
-    html.light .glass-card { background: rgba(255, 255, 255, 0.92) !important; border-color: #e2e8f0 !important; color: #0f172a !important; }
-    html.light header { background-color: rgba(255, 255, 255, 0.85) !important; border-color: #e2e8f0 !important; }
-    html.light .text-white { color: #0f172a !important; }
-    html.light .text-slate-400 { color: #64748b !important; }
+    html.light body { background-color: #F8FAFC !important; color: #0F172A !important; }
+    html.light .glass-card { background: rgba(255, 255, 255, 0.95) !important; border-color: rgba(0, 0, 0, 0.08) !important; color: #0F172A !important; box-shadow: 0 4px 20px -2px rgba(0,0,0,0.05); }
+    html.light header { background-color: rgba(255, 255, 255, 0.85) !important; border-color: rgba(0, 0, 0, 0.08) !important; }
+    html.light .text-white { color: #0F172A !important; }
+    html.light .text-slate-400 { color: #64748B !important; }
     html.light .text-slate-300 { color: #475569 !important; }
     html.light .text-slate-200 { color: #334155 !important; }
-    html.light .bg-slate-900, html.light [class*="bg-slate-900"], html.light .bg-slate-950 { background-color: #ffffff !important; }
-    html.light .bg-slate-800, html.light [class*="bg-slate-800"] { background-color: #f1f5f9 !important; border-color: #cbd5e1 !important; color: #1e293b !important; }
-    html.light .border-slate-800, html.light [class*="border-slate-800"], html.light .border-slate-700 { border-color: #e2e8f0 !important; }
+    html.light .bg-slate-900, html.light [class*="bg-slate-900"], html.light .bg-slate-950 { background-color: #F1F5F9 !important; }
+    html.light .bg-slate-800, html.light [class*="bg-slate-800"] { background-color: #E2E8F0 !important; border-color: #CBD5E1 !important; color: #1E293B !important; }
+    html.light .border-slate-800, html.light [class*="border-slate-800"], html.light .border-slate-700 { border-color: #E2E8F0 !important; }
   </style>
   <script>
     function initTheme() {
@@ -2654,8 +2877,6 @@ COMMON_HEADER_HTML = """
     initTheme();
   </script>
 """
-
-# ----------------- 1. LANDING & REGISTRATION PAGE (BILINGUAL) ----------------- #
 
 LANDING_PAGE_HTML = f"""<!DOCTYPE html>
 <html lang="fa" dir="rtl" class="dark">
@@ -3115,2220 +3336,1147 @@ LANDING_PAGE_HTML = f"""<!DOCTYPE html>
 
 # ----------------- 2. END-USER PERSONAL DASHBOARD (BILINGUAL) ----------------- #
 
-DASHBOARD_PAGE_HTML = f"""<!DOCTYPE html>
+DASHBOARD_PAGE_HTML = """<!DOCTYPE html>
 <html lang="fa" dir="rtl" class="dark">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>داشبورد کاربری | Home VPN Platform</title>
-  {COMMON_HEADER_HTML}
+  <title id="docTitle">داشبورد کاربری | Family Home VPN</title>
+  __COMMON_HEADER__
 </head>
-<body class="bg-slate-950 text-slate-100 min-h-screen selection:bg-indigo-500 selection:text-white flex flex-col justify-between">
+<body class="bg-[#0B0F19] text-slate-100 min-h-screen selection:bg-indigo-500 selection:text-white flex flex-col justify-between antialiased">
   
   <!-- Navigation Header -->
-  <header class="border-b border-slate-800/80 bg-slate-900/60 sticky top-0 z-40 backdrop-blur-md">
+  <header class="border-b border-white/[0.08] bg-[#0B0F19]/80 sticky top-0 z-40 backdrop-blur-md">
     <div class="max-w-6xl mx-auto px-4 h-16 flex items-center justify-between">
-      <div class="flex items-center space-x-3 space-x-reverse">
-        <div class="p-2 rounded-xl bg-gradient-to-tr from-indigo-600 to-cyan-500 text-white shadow-lg shadow-indigo-500/20">
-          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/></svg>
+      <div class="flex items-center gap-3">
+        <div class="w-8 h-8 rounded-xl bg-indigo-600 flex items-center justify-center text-white shadow-sm font-bold text-xs tracking-wider">
+          VPN
         </div>
         <div>
-          <div class="flex items-center gap-2">
-            <h1 class="font-bold text-sm sm:text-base text-white leading-none">
-              <span id="txtUserGreeting">سلام، کاربر گرامی</span>
-            </h1>
-            <span id="badgeOnlineHeader" class="px-2 py-0.5 text-[10px] rounded-full bg-slate-800 text-slate-400 border border-slate-700 flex items-center gap-1">
-              <span class="w-1.5 h-1.5 rounded-full bg-slate-500"></span>
-              <span id="txtOnlineHeader">در حال بررسی...</span>
-            </span>
-          </div>
-          <p id="txtSubHeader" class="text-xs text-slate-400 mt-0.5">داشبورد اختصاصی مدیریت اشتراک فیلترشکن</p>
+          <span class="font-bold text-sm sm:text-base text-white tracking-tight">Family Home VPN</span>
         </div>
       </div>
 
-      <div class="flex items-center gap-3">
-        <!-- Help & Guide Link -->
-        <a href="/help" class="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-semibold text-slate-200 transition flex items-center gap-1.5 shadow-sm">
-          <svg class="w-4 h-4 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253"/></svg>
-          <span>راهنما / Help</span>
+      <!-- Essential Nav Links Only -->
+      <div class="flex items-center gap-2 sm:gap-3 text-xs">
+        <a href="/dashboard" class="px-3 py-1.5 rounded-lg text-slate-200 hover:text-white hover:bg-white/[0.05] transition font-medium">
+          <span id="navDash">داشبورد</span>
         </a>
-
-        <!-- Theme Toggle -->
-        <button onclick="toggleTheme()" class="px-2.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 transition" title="Toggle Theme">
-          <svg class="w-4 h-4 text-amber-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"/></svg>
-        </button>
-
-        <!-- Language Switcher -->
-        <button onclick="toggleLang()" class="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-semibold text-slate-200 transition flex items-center gap-1.5 shadow-sm">
-          <svg class="w-4 h-4 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 5h12M9 3v2m1.048 9.5A18.022 18.022 0 016.412 9m6.088 9h7M11 21l5-10 5 10M12.751 5C11.783 10.77 8.07 15.61 3 18.129"/></svg>
+        <a href="#direct-routing" onclick="openDirectDomainsModal()" class="px-3 py-1.5 rounded-lg text-slate-300 hover:text-white hover:bg-white/[0.05] transition font-medium">
+          <span id="navDirect">مسیر مستقیم ایران</span>
+        </a>
+        <a href="/help" class="px-3 py-1.5 rounded-lg text-slate-300 hover:text-white hover:bg-white/[0.05] transition font-medium">
+          <span id="navHelp">راهنما</span>
+        </a>
+        <button onclick="toggleLang()" class="px-2.5 py-1.5 rounded-lg text-slate-300 hover:text-white hover:bg-white/[0.05] transition font-semibold">
           <span id="langSwitchLabel">English</span>
         </button>
-
-        <!-- Admin Control Center Link (if admin) -->
-        <a id="linkAdmin" href="/admin" class="hidden px-3 py-1.5 rounded-xl bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/30 text-xs font-semibold transition items-center gap-1">
-          <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
-          <span id="txtAdminLink">پنل مدیریت</span>
+        <button onclick="toggleTheme()" class="p-1.5 rounded-lg text-slate-300 hover:text-white hover:bg-white/[0.05] transition" title="Toggle Theme">
+          <svg class="w-4 h-4 text-amber-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"/></svg>
+        </button>
+        <a id="linkAdmin" href="/admin" class="hidden px-2.5 py-1.5 rounded-lg bg-indigo-600/20 text-indigo-300 hover:bg-indigo-600/30 transition font-medium">
+          <span id="navAdmin">پنل ادمین</span>
         </a>
-
-        <!-- Logout -->
-        <a href="/logout" class="px-3 py-1.5 rounded-xl bg-rose-950/60 hover:bg-rose-900/80 text-rose-300 border border-rose-800/80 text-xs font-semibold transition flex items-center gap-1">
-          <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/></svg>
-          <span id="txtLogout">خروج</span>
+        <a href="/logout" class="px-2.5 py-1.5 rounded-lg text-rose-400 hover:bg-rose-500/10 transition font-medium">
+          <span id="navLogout">خروج</span>
         </a>
       </div>
     </div>
   </header>
 
-  <!-- Main Content -->
-  <main class="max-w-6xl mx-auto px-4 py-8 flex-1 w-full space-y-8">
-    
-    <!-- Top KPI Cards Grid -->
-    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+  <!-- Main Content: Single focused card with 3 elements -->
+  <main class="max-w-xl mx-auto px-4 py-8 sm:py-12 flex-1 w-full">
+    <div class="glass-card rounded-3xl p-6 sm:p-8 space-y-7 shadow-2xl">
       
-      <!-- Card 1: Connection Status -->
-      <div class="glass-card p-6 rounded-3xl border border-slate-800 shadow-xl flex flex-col justify-between">
-        <div class="flex items-center justify-between mb-4">
-          <span id="lblCardStatusTitle" class="text-xs font-bold text-slate-400 uppercase tracking-wider">وضعیت زنده اتصال</span>
-          <div class="p-2 rounded-2xl bg-slate-800 text-indigo-400">
-            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.111 16.404a5.5 5.5 0 017.778 0M12 20h.01m-7.08-7.071c3.904-3.905 10.236-3.905 14.141 0M1.394 9.393c5.857-5.857 15.355-5.857 21.213 0"/></svg>
-          </div>
+      <!-- Element 1: Connection Status & Speed Tier -->
+      <div class="text-center space-y-2">
+        <div class="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-xs font-semibold">
+          <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+          <span id="txtConnectionStatus">در حال بررسی اتصال...</span>
         </div>
-
-        <div class="space-y-3">
-          <div class="flex items-center gap-3">
-            <div id="statusDot" class="w-3.5 h-3.5 rounded-full bg-slate-500"></div>
-            <span id="txtLiveStatus" class="text-lg font-bold text-white">در حال بررسی...</span>
-          </div>
-          <div class="text-xs text-slate-400 space-y-1">
-            <div class="flex justify-between">
-              <span id="lblLastSeen">آخرین اتصال:</span>
-              <span id="valLastSeen" class="font-semibold text-slate-200">تاکنون</span>
-            </div>
-            <div class="flex justify-between">
-              <span id="lblServerGateway">دروازه سرور:</span>
-              <span class="font-semibold text-emerald-400">اروپا (Ireland Tunnel)</span>
-            </div>
-          </div>
-        </div>
-
-        <div class="mt-4 pt-3 border-t border-slate-800 text-[11px] text-slate-500 flex items-center justify-between">
-          <span id="lblAutoSplit">تفکیک هوشمند ترافیک ایران:</span>
-          <span class="text-emerald-400 font-semibold">فعال (Direct)</span>
+        <div class="text-xs text-slate-400 font-medium">
+          <span id="valUserEmail" class="font-bold text-slate-200">-</span> • <span id="valDataUsed">0 B</span> <span id="lblUsedSuffix">مصرف شده</span>
         </div>
       </div>
 
-      <!-- Card 2: Data Usage & Quota -->
-      <div class="glass-card p-6 rounded-3xl border border-slate-800 shadow-xl flex flex-col justify-between">
-        <div class="flex items-center justify-between mb-4">
-          <span id="lblCardUsageTitle" class="text-xs font-bold text-slate-400 uppercase tracking-wider">حجم مصرفی و سقف مجاز</span>
-          <div class="p-2 rounded-2xl bg-slate-800 text-cyan-400">
-            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
+      <!-- Element 2: One-Tap Subscription Copy & Scannable QR Code -->
+      <div class="space-y-4 pt-3 border-t border-white/[0.08]">
+        <!-- Format Switcher -->
+        <div class="flex p-1 rounded-xl bg-slate-900/90 border border-white/[0.08] text-xs">
+          <button id="btnFormatSingbox" onclick="switchFormat('singbox')" class="flex-1 py-2 rounded-lg font-semibold transition bg-indigo-600 text-white shadow">
+            Hiddify / Sing-box
+          </button>
+          <button id="btnFormatVless" onclick="switchFormat('vless')" class="flex-1 py-2 rounded-lg font-semibold transition text-slate-400 hover:text-white">
+            v2rayNG / Streisand
+          </button>
+        </div>
+
+        <!-- Scannable QR Code -->
+        <div class="flex justify-center">
+          <div class="p-3 bg-white rounded-2xl shadow-md border border-slate-200">
+            <img id="imgSubQr" src="" alt="Subscription QR" class="w-48 h-48 sm:w-52 sm:h-52 object-contain">
           </div>
         </div>
 
-        <div class="space-y-3">
-          <div class="flex items-baseline justify-between">
-            <span id="valTotalUsed" class="text-2xl font-extrabold text-white">0 B</span>
-            <span id="valLimit" class="text-xs text-slate-400">از سقف: نامحدود</span>
-          </div>
-
-          <!-- Progress Bar -->
-          <div class="w-full bg-slate-800 rounded-full h-2.5 overflow-hidden">
-            <div id="usageBar" class="bg-gradient-to-r from-indigo-500 to-cyan-400 h-2.5 rounded-full transition-all duration-500" style="width: 5%"></div>
-          </div>
-
-          <div class="grid grid-cols-2 gap-2 text-xs text-slate-400 pt-1">
-            <div>
-              <span id="lblUpload">ارسال:</span>
-              <span id="valUpload" class="font-mono text-slate-200">0 B</span>
-            </div>
-            <div>
-              <span id="lblDownload">دریافت:</span>
-              <span id="valDownload" class="font-mono text-slate-200">0 B</span>
-            </div>
-          </div>
-        </div>
-
-        <div class="mt-4 pt-3 border-t border-slate-800 text-[11px] text-slate-500 flex items-center justify-between">
-          <span id="lblExpiry">تاریخ انقضا:</span>
-          <span id="valExpiry" class="text-slate-300 font-semibold">دائمی (Never)</span>
-        </div>
-      </div>
-
-      <!-- Card 3: Anti-DPI & Fallback Lines -->
-      <div class="glass-card p-6 rounded-3xl border border-slate-800 shadow-xl flex flex-col justify-between">
-        <div class="flex items-center justify-between mb-4">
-          <span id="lblCardResilience" class="text-xs font-bold text-slate-400 uppercase tracking-wider">پایداری و مقاومت فیلترینگ</span>
-          <div class="p-2 rounded-2xl bg-slate-800 text-emerald-400">
-            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg>
-          </div>
-        </div>
-
-        <div class="space-y-2 text-xs">
-          <div class="flex items-center justify-between py-1 border-b border-slate-800/60">
-            <span class="text-slate-300 flex items-center gap-1.5">
-              <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
-              <span>TLS Fragmentation</span>
-            </span>
-            <span class="font-mono text-emerald-400 text-[11px]">Active (10-30 pkts)</span>
-          </div>
-          <div class="flex items-center justify-between py-1 border-b border-slate-800/60">
-            <span class="text-slate-300 flex items-center gap-1.5">
-              <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
-              <span>uTLS Fingerprint</span>
-            </span>
-            <span class="font-mono text-indigo-400 text-[11px]">Firefox Browser</span>
-          </div>
-          <div class="flex items-center justify-between py-1">
-            <span class="text-slate-300 flex items-center gap-1.5">
-              <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
-              <span>Clean Anycast IPs</span>
-            </span>
-            <span class="font-mono text-cyan-400 text-[11px]">3 Backup Lines</span>
-          </div>
-        </div>
-
-        <div class="mt-4 pt-3 border-t border-slate-800 text-[11px] text-slate-500 flex items-center justify-between">
-          <span id="lblSplitDns">سیستم تفکیک DNS:</span>
-          <span class="text-indigo-400 font-semibold">178.22.122.100 (Iran)</span>
-        </div>
-      </div>
-
-    </div>
-
-    <!-- One-Click Setup & QR Code Section -->
-    <div class="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
-      
-      <!-- Subscription Link & One-Click Tools (7 Cols) -->
-      <div class="lg:col-span-7 glass-card p-6 sm:p-8 rounded-3xl border border-slate-800 shadow-2xl space-y-6">
-        <div>
-          <div class="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-indigo-950/80 border border-indigo-800 text-[11px] font-semibold text-indigo-300 mb-2">
-            <span>یک کلیک تا اتصال</span>
-          </div>
-          <h3 id="txtSubSectionTitle" class="text-xl font-bold text-white">لینک هوشمند اشتراک اختصاصی شما</h3>
-          <p id="txtSubSectionDesc" class="text-xs text-slate-400 mt-1">این لینک را کپی کرده و در برنامه فیلترشکن خود (Hiddify یا v2rayNG یا Streisand) اضافه کنید.</p>
-        </div>
-
-        <!-- Copy Subscription URL Box -->
+        <!-- One-Tap Copy Button -->
         <div class="space-y-2">
-          <div class="flex flex-col sm:flex-row items-stretch gap-2">
-            <input type="text" id="inputSubUrl" readonly class="flex-1 px-4 py-3 rounded-2xl bg-slate-950 border border-slate-700 text-xs sm:text-sm font-mono text-indigo-200 select-all focus:outline-none focus:border-indigo-500 ltr-only">
-            <button onclick="copySubUrl()" id="btnCopySub" class="px-6 py-3 rounded-2xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs sm:text-sm shadow-lg shadow-indigo-600/30 transition flex items-center justify-center gap-2 shrink-0">
-              <svg id="copyIcon" class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
-              <span id="btnCopySubText">کپی لینک اشتراک</span>
-            </button>
-          </div>
-          <div id="copyToast" class="hidden text-xs text-emerald-400 font-semibold px-2 flex items-center gap-1.5">
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>
-            <span id="txtCopiedToast">لینک در کلیپ‌بورد کپی شد!</span>
-          </div>
+          <button id="btnCopySub" onclick="copyActiveSubscription()" class="w-full py-3.5 px-4 rounded-xl bg-indigo-600 hover:bg-indigo-500 active:scale-[0.99] text-white font-semibold text-xs sm:text-sm transition flex items-center justify-center gap-2 shadow-lg shadow-indigo-600/20">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7v8a2 2 0 002 2h6M8 7V5a2 2 0 012-2h4.586a1 1 0 01.707.293l4.414 4.414a1 1 0 01.293.707V15a2 2 0 01-2 2h-2M8 7H6a2 2 0 00-2 2v10a2 2 0 002 2h8a2 2 0 002-2v-2"/></svg>
+            <span id="txtBtnCopySub">کپی لینک هوشمند اشتراک</span>
+          </button>
+          <input id="inputSubUrl" readonly type="text" class="w-full px-3 py-2 rounded-lg bg-slate-950/70 border border-white/[0.08] text-[11px] font-mono text-slate-400 select-all text-center focus:outline-none ltr-only">
         </div>
-
-        <!-- Direct Downloads Row -->
-        <div class="pt-4 border-t border-slate-800 space-y-3">
-          <span id="lblManualDownloads" class="block text-xs font-semibold text-slate-400">دانلود مستقیم فایل و کانفیگ‌ها:</span>
-          <div class="flex flex-wrap gap-2.5">
-            <a id="btnDownloadJson" href="#" download class="px-4 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700 text-xs font-semibold text-slate-200 transition flex items-center gap-2">
-              <svg class="w-4 h-4 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
-              <span>دانلود کانفیگ Sing-box (JSON)</span>
-            </a>
-            <a id="btnDownloadVless" href="#" download class="px-4 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700 text-xs font-semibold text-slate-200 transition flex items-center gap-2">
-              <svg class="w-4 h-4 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
-              <span>دانلود لینک‌های VLESS</span>
-            </a>
-            <button onclick="copyFarsiGuide()" class="px-4 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700 text-xs font-semibold text-slate-200 transition flex items-center gap-2">
-              <svg class="w-4 h-4 text-amber-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"/></svg>
-              <span>کپی متن راهنما برای واتساپ/تلگرام</span>
-            </button>
-          </div>
-        </div>
-
       </div>
 
-      <!-- Scannable QR Code Card (5 Cols) -->
-      <div class="lg:col-span-5 glass-card p-6 sm:p-8 rounded-3xl border border-slate-800 shadow-2xl flex flex-col items-center text-center space-y-4">
-        <div>
-          <h4 id="txtQrTitle" class="text-base font-bold text-white">اسکن کد QR با دوربین گوشی</h4>
-          <p id="txtQrDesc" class="text-xs text-slate-400 mt-0.5">در برنامه فیلترشکن، علامت اسکن یا ➕ را بزنید و این تصویر را اسکن کنید.</p>
+      <!-- Element 3: Simple 2-Step Quick Start -->
+      <div class="space-y-3 pt-3 border-t border-white/[0.08]">
+        <div class="text-[11px] font-bold text-slate-400 uppercase tracking-wider text-center" id="txtQuickStartTitle">
+          راهنمای سریع اتصال در ۲ گام
         </div>
-
-        <div class="p-3 bg-white rounded-3xl shadow-2xl border-4 border-indigo-600/30">
-          <img id="imgQrCode" src="" alt="VPN QR Code" class="w-52 h-52 sm:w-56 sm:h-56 object-contain rounded-xl">
-        </div>
-
-        <div class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-slate-900 border border-slate-800 text-[11px] text-slate-400">
-          <svg class="w-3.5 h-3.5 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
-          <span id="txtQrTip">حاوی ۴ سرور پشتیبان و قوانین تفکیک ایران</span>
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+          <div class="p-3.5 rounded-2xl bg-white/[0.03] border border-white/[0.06] space-y-1.5">
+            <div class="font-bold text-white flex items-center gap-1.5">
+              <span class="w-5 h-5 rounded-full bg-indigo-600/30 text-indigo-400 flex items-center justify-center text-[10px] font-bold">1</span>
+              <span id="txtStep1Title">نصب نرم‌افزار</span>
+            </div>
+            <p id="txtStep1Desc" class="text-slate-400 text-[11px] leading-relaxed">
+              دانلود <a href="https://hiddify.com" target="_blank" class="text-indigo-400 font-semibold underline">Hiddify</a> یا <a href="https://github.com/2dust/v2rayNG/releases" target="_blank" class="text-indigo-400 font-semibold underline">v2rayNG</a> برای اندروید، آیفون یا ویندوز.
+            </p>
+          </div>
+          <div class="p-3.5 rounded-2xl bg-white/[0.03] border border-white/[0.06] space-y-1.5">
+            <div class="font-bold text-white flex items-center gap-1.5">
+              <span class="w-5 h-5 rounded-full bg-indigo-600/30 text-indigo-400 flex items-center justify-center text-[10px] font-bold">2</span>
+              <span id="txtStep2Title">افزودن لینک و اتصال</span>
+            </div>
+            <p id="txtStep2Desc" class="text-slate-400 text-[11px] leading-relaxed">
+              دکمه کپی لینک بالا را بزنید، وارد برنامه شوید، علامت ➕ (Import) را لمس کنید و سپس متصل شوید.
+            </p>
+          </div>
         </div>
       </div>
 
     </div>
-
-    <!-- Step-by-Step App Guides Section -->
-    <div class="glass-card p-6 sm:p-8 rounded-3xl border border-slate-800 shadow-2xl space-y-6">
-      
-      <div>
-        <h3 id="txtGuidesTitle" class="text-xl font-bold text-white">راهنمای راه‌اندازی گام‌به‌گام در گوشی شما</h3>
-        <p id="txtGuidesDesc" class="text-xs text-slate-400 mt-1">یکی از برنامه‌های استاندارد زیر را نصب کرده و در ۳ مرحله ساده وصل شوید.</p>
-      </div>
-
-      <!-- App Tabs -->
-      <div class="flex gap-2 p-1 bg-slate-950/80 rounded-2xl border border-slate-800 max-w-md">
-        <button id="tabAppAndroid" onclick="switchAppTab('android')" class="flex-1 py-2.5 text-xs font-bold rounded-xl transition bg-indigo-600 text-white shadow-md flex items-center justify-center gap-2">
-          <span>📱 اندروید (Android)</span>
-        </button>
-        <button id="tabAppIos" onclick="switchAppTab('ios')" class="flex-1 py-2.5 text-xs font-bold rounded-xl transition text-slate-400 hover:text-white flex items-center justify-center gap-2">
-          <span>🍏 آیفون و آیپد (iOS)</span>
-        </button>
-      </div>
-
-      <!-- 1. ANDROID GUIDE CONTENT -->
-      <div id="guideAndroid" class="space-y-6">
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <!-- Hiddify Box -->
-          <div class="p-5 rounded-2xl bg-slate-900/90 border border-indigo-500/30 space-y-3">
-            <div class="flex items-center justify-between">
-              <div class="flex items-center gap-2">
-                <span class="text-xl">🚀</span>
-                <div>
-                  <h4 class="font-bold text-sm text-white">Hiddify (پیشنهاد اصلی)</h4>
-                  <span class="text-[10px] text-emerald-400 font-semibold">پشتیبانی کامل از Sing-box و تفکیک هوشمند</span>
-                </div>
-              </div>
-              <span class="px-2 py-0.5 text-[10px] rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">توصیه شده</span>
-            </div>
-            <p class="text-xs text-slate-300 leading-relaxed">فوق‌العاده سریع، بدون تبلیغات و خودکار. نیازی به هیچ تنظیم دستی ندارد.</p>
-            <div class="flex gap-2 pt-1">
-              <a href="https://play.google.com/store/apps/details?id=app.hiddify.com" target="_blank" class="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-white border border-slate-700 transition">گوگل پلی (Google Play)</a>
-              <a href="https://github.com/hiddify/hiddify-next/releases/latest" target="_blank" class="px-3.5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white transition">دانلود مستقیم APK</a>
-            </div>
-          </div>
-
-          <!-- v2rayNG Box -->
-          <div class="p-5 rounded-2xl bg-slate-900/90 border border-slate-800 space-y-3">
-            <div class="flex items-center gap-2">
-              <span class="text-xl">⚡</span>
-              <div>
-                <h4 class="font-bold text-sm text-white">v2rayNG</h4>
-                <span class="text-[10px] text-slate-400">کلاسیک و پایدار برای اندروید</span>
-              </div>
-            </div>
-            <p class="text-xs text-slate-300 leading-relaxed">برنامه پرطرفدار و پرسرعت برای اتصال با لینک VLESS و اشتراک معمولی.</p>
-            <div class="flex gap-2 pt-1">
-              <a href="https://play.google.com/store/apps/details?id=com.v2ray.ang" target="_blank" class="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-white border border-slate-700 transition">گوگل پلی (Google Play)</a>
-              <a href="https://github.com/2dust/v2rayNG/releases/latest" target="_blank" class="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-white border border-slate-700 transition">دانلود مستقیم APK</a>
-            </div>
-          </div>
-        </div>
-
-        <!-- 3 Steps for Android -->
-        <div class="p-5 rounded-2xl bg-slate-900/60 border border-slate-800/80 space-y-3">
-          <h4 class="font-bold text-xs text-indigo-300 uppercase tracking-wider">مراحل ۳ گانه اتصال در اندروید:</h4>
-          <ol class="text-xs text-slate-300 space-y-2 list-decimal list-inside leading-relaxed">
-            <li>برنامه <b>Hiddify</b> یا <b>v2rayNG</b> را از لینک‌های بالا نصب کنید.</li>
-            <li>دکمه <b>«کپی لینک اشتراک»</b> در بالای همین صفحه را لمس کنید تا لینک کپی شود.</li>
-            <li>برنامه را باز کنید، علامت <b>➕</b> یا <b>«افزودن از کلیپ‌بورد» (Import)</b> را لمس کنید و سپس دکمه دایره‌ای اتصال را بزنید تا متصل شوید!</li>
-          </ol>
-        </div>
-      </div>
-
-      <!-- 2. IOS GUIDE CONTENT -->
-      <div id="guideIos" class="space-y-6 hidden">
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <!-- Streisand Box -->
-          <div class="p-5 rounded-2xl bg-slate-900/90 border border-indigo-500/30 space-y-3">
-            <div class="flex items-center justify-between">
-              <div class="flex items-center gap-2">
-                <span class="text-xl">🍏</span>
-                <div>
-                  <h4 class="font-bold text-sm text-white">Streisand (پیشنهاد آیفون)</h4>
-                  <span class="text-[10px] text-emerald-400 font-semibold">پشتیبانی کامل از Sing-box و VLESS</span>
-                </div>
-              </div>
-              <span class="px-2 py-0.5 text-[10px] rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">توصیه شده</span>
-            </div>
-            <p class="text-xs text-slate-300 leading-relaxed">برنامه عالی و رایگان در اپ‌استور با پشتیبانی عالی از دور زدن اختلالات.</p>
-            <div class="pt-1">
-              <a href="https://apps.apple.com/us/app/streisand/id6450534064" target="_blank" class="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white transition inline-flex items-center gap-1.5">
-                <span>دانلود از اپ‌استور (App Store)</span>
-                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
-              </a>
-            </div>
-          </div>
-
-          <!-- V2Box Box -->
-          <div class="p-5 rounded-2xl bg-slate-900/90 border border-slate-800 space-y-3">
-            <div class="flex items-center gap-2">
-              <span class="text-xl">📦</span>
-              <div>
-                <h4 class="font-bold text-sm text-white">V2Box</h4>
-                <span class="text-[10px] text-slate-400">ساده و سریع برای آیفون و آیپد</span>
-              </div>
-            </div>
-            <p class="text-xs text-slate-300 leading-relaxed">محیط کاربری بسیار روان و سازگار با انواع پروتکل‌های V2Ray.</p>
-            <div class="pt-1">
-              <a href="https://apps.apple.com/us/app/v2box-v2ray-client/id6446814690" target="_blank" class="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-white border border-slate-700 transition inline-flex items-center gap-1.5">
-                <span>دانلود از اپ‌استور (App Store)</span>
-                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
-              </a>
-            </div>
-          </div>
-        </div>
-
-        <!-- 3 Steps for iOS -->
-        <div class="p-5 rounded-2xl bg-slate-900/60 border border-slate-800/80 space-y-3">
-          <h4 class="font-bold text-xs text-indigo-300 uppercase tracking-wider">مراحل ۳ گانه اتصال در آیفون:</h4>
-          <ol class="text-xs text-slate-300 space-y-2 list-decimal list-inside leading-relaxed">
-            <li>برنامه <b>Streisand</b> یا <b>V2Box</b> را از اپ‌استور دانلود کنید.</li>
-            <li>دکمه <b>«کپی لینک اشتراک»</b> در بالای همین صفحه را لمس کنید.</li>
-            <li>در برنامه علامت <b>➕</b> را زده، گزینه <b>Add Subscription</b> را انتخاب و لینک را جای‌گذاری (Paste) کنید، سپس متصل شوید!</li>
-          </ol>
-        </div>
-      </div>
-
-      <!-- Iranian Banking Callout Box -->
-      <div class="p-4 sm:p-5 rounded-2xl bg-amber-950/40 border border-amber-800/60 flex items-start gap-3">
-        <div class="p-2 rounded-xl bg-amber-500/10 text-amber-400 shrink-0">
-          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
-        </div>
-        <div class="space-y-1">
-          <h4 id="txtBankingTipTitle" class="font-bold text-xs sm:text-sm text-amber-200">نکته بسیار مهم برای همراه بانک‌ها، اسنپ و برنامه‌های داخلی:</h4>
-          <p id="txtBankingTipDesc" class="text-xs text-amber-300/80 leading-relaxed">
-            تمامی سایت‌های ایرانی، بانکی، اسنپ و دیجی‌کالا به صورت خودکار بدون فیلترشکن و با اینترنت عادی باز می‌شوند. با این وجود، اگر همراه بانک خاصی در گوشی شما نسبت به فیلترشکن حساس است، می‌توانید در تنظیمات برنامه Hiddify یا v2rayNG گزینه <b>پروکسی بر اساس برنامه (Per-App Proxy)</b> را فعال کرده و برنامه‌های بانکی را تیک نزنید تا به طور کامل از تونل فیلترشکن مستثنی شوند.
-          </p>
-        </div>
-      </div>
-
-    </div>
-
   </main>
 
-  <!-- Footer -->
-  <footer class="border-t border-slate-800/80 bg-slate-900/40 py-4 text-center text-xs text-slate-400">
-    <div class="max-w-6xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-2">
-      <span>سرور فیلترشکن خانواده • اختصاصی توحید</span>
-      <span class="text-slate-400 font-mono text-[11px]">Clean Cloudflare Anycast Fallback Lines Active</span>
+  <!-- Direct Routing Modal -->
+  <div id="directRoutingModal" class="hidden fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+    <div class="glass-card rounded-3xl p-6 max-w-md w-full space-y-4">
+      <div class="flex items-center justify-between">
+        <h4 class="font-bold text-sm text-white" id="modalDirectTitle">مسیر مستقیم و تفکیک خودکار ایران</h4>
+        <button onclick="closeDirectDomainsModal()" class="text-slate-400 hover:text-white">✕</button>
+      </div>
+      <p class="text-xs text-slate-300 leading-relaxed" id="modalDirectDesc">
+        تمامی وب‌سایت‌های بانکی، اپلیکیشن‌های پرداخت، اسنپ، دیجی‌کالا و سایت‌های داخلی به صورت خودکار بدون فیلترشکن و با اینترنت معمولی و ارزان باز می‌شوند و هیچ حجمی از اشتراک شما کسر نمی‌گردد.
+      </p>
+      <div class="pt-2">
+        <button onclick="closeDirectDomainsModal()" class="w-full py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold">
+          متوجه شدم
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast Notification -->
+  <div id="toast" class="fixed bottom-6 left-1/2 -translate-x-1/2 px-4 py-2 rounded-xl bg-emerald-600 text-white text-xs font-semibold shadow-xl opacity-0 transition-opacity duration-300 pointer-events-none z-50">
+    کپی شد!
+  </div>
+
+  <footer class="border-t border-white/[0.08] py-4 text-center text-xs text-slate-500">
+    <div class="max-w-6xl mx-auto px-4 flex items-center justify-between">
+      <span>Family Home VPN</span>
+      <span class="text-[11px] font-mono text-emerald-400/80">Cloudflare Tunnel Active</span>
     </div>
   </footer>
 
   <script>
-    let mySubUrl = '';
-    let myFarsiGuide = '';
+    let userData = null;
+    let currentFormat = 'singbox';
     let currentLang = localStorage.getItem('vpn_lang') || 'fa';
 
-    function setLanguage(lang) {{
+    const i18n = {
+      fa: {
+        docTitle: 'داشبورد کاربری | Family Home VPN',
+        navDash: 'داشبورد',
+        navDirect: 'مسیر مستقیم ایران',
+        navHelp: 'راهنما',
+        navLogout: 'خروج',
+        navAdmin: 'پنل مدیریت',
+        langLabel: 'English',
+        copyBtn: 'کپی لینک هوشمند اشتراک',
+        copied: 'لینک اشتراک با موفقیت کپی شد!',
+        quickTitle: 'راهنمای سریع اتصال در ۲ گام',
+        step1Title: 'نصب نرم‌افزار',
+        step1Desc: 'دانلود Hiddify یا v2rayNG برای اندروید، آیفون، مک یا ویندوز.',
+        step2Title: 'افزودن لینک و اتصال',
+        step2Desc: 'دکمه کپی لینک بالا را بزنید، وارد برنامه شوید، علامت ➕ (Import) را لمس کنید و سپس متصل شوید.',
+        usedSuffix: 'مصرف شده',
+        activeTier: 'فعال',
+        unlimited: 'سرعت نامحدود',
+        modalTitle: 'مسیر مستقیم و تفکیک خودکار ایران',
+        modalDesc: 'تمامی وب‌سایت‌های بانکی، اپلیکیشن‌های پرداخت، اسنپ، دیجی‌کالا و سایت‌های داخلی به صورت خودکار بدون فیلترشکن باز می‌شوند.',
+        modalBtn: 'متوجه شدم'
+      },
+      en: {
+        docTitle: 'Personal Dashboard | Family Home VPN',
+        navDash: 'Dashboard',
+        navDirect: 'Direct Routing',
+        navHelp: 'Help',
+        navLogout: 'Logout',
+        navAdmin: 'Admin Center',
+        langLabel: 'فارسی',
+        copyBtn: 'Copy Subscription Link',
+        copied: 'Subscription URL copied to clipboard!',
+        quickTitle: '2-Step Quick Start Guide',
+        step1Title: 'Install App',
+        step1Desc: 'Download Hiddify or v2rayNG for Android, iOS, Mac, or Windows.',
+        step2Title: 'Paste Link & Connect',
+        step2Desc: 'Copy the link above, open the app, tap "+" to import from clipboard, and tap Connect.',
+        usedSuffix: 'used',
+        activeTier: 'Active',
+        unlimited: 'Unlimited',
+        modalTitle: 'Iran Direct Traffic Split-Tunneling',
+        modalDesc: 'All Iranian banking, payment, and domestic services bypass the proxy automatically without consuming VPN quota.',
+        modalBtn: 'Got it'
+      }
+    };
+
+    function setLanguage(lang) {
       currentLang = lang;
       localStorage.setItem('vpn_lang', lang);
       const isRtl = (lang === 'fa');
-
       document.documentElement.setAttribute('lang', lang);
       document.documentElement.setAttribute('dir', isRtl ? 'rtl' : 'ltr');
-      document.getElementById('langSwitchLabel').textContent = (lang === 'fa' ? 'English' : 'فارسی');
+      
+      const t = i18n[currentLang];
+      document.getElementById('docTitle').textContent = t.docTitle;
+      document.getElementById('navDash').textContent = t.navDash;
+      document.getElementById('navDirect').textContent = t.navDirect;
+      document.getElementById('navHelp').textContent = t.navHelp;
+      document.getElementById('navLogout').textContent = t.navLogout;
+      document.getElementById('navAdmin').textContent = t.navAdmin;
+      document.getElementById('langSwitchLabel').textContent = t.langLabel;
+      document.getElementById('txtBtnCopySub').textContent = t.copyBtn;
+      document.getElementById('txtQuickStartTitle').textContent = t.quickTitle;
+      document.getElementById('txtStep1Title').textContent = t.step1Title;
+      document.getElementById('txtStep1Desc').innerHTML = (lang === 'fa')
+        ? 'دانلود <a href="https://hiddify.com" target="_blank" class="text-indigo-400 font-semibold underline">Hiddify</a> یا <a href="https://github.com/2dust/v2rayNG/releases" target="_blank" class="text-indigo-400 font-semibold underline">v2rayNG</a> برای اندروید، آیفون یا ویندوز.'
+        : 'Download <a href="https://hiddify.com" target="_blank" class="text-indigo-400 font-semibold underline">Hiddify</a> or <a href="https://github.com/2dust/v2rayNG/releases" target="_blank" class="text-indigo-400 font-semibold underline">v2rayNG</a> for Android, iOS, or Windows.';
+      document.getElementById('txtStep2Title').textContent = t.step2Title;
+      document.getElementById('txtStep2Desc').textContent = t.step2Desc;
+      document.getElementById('lblUsedSuffix').textContent = t.usedSuffix;
+      document.getElementById('modalDirectTitle').textContent = t.modalTitle;
+      document.getElementById('modalDirectDesc').textContent = t.modalDesc;
 
-      if (lang === 'en') {{
-        document.title = 'Personal Dashboard | Home VPN Platform';
-        document.getElementById('txtSubHeader').textContent = 'Personal VPN subscription management dashboard';
-        document.getElementById('txtLogout').textContent = 'Logout';
-        document.getElementById('lblCardStatusTitle').textContent = 'Live Connection Status';
-        document.getElementById('lblLastSeen').textContent = 'Last Connected:';
-        document.getElementById('lblServerGateway').textContent = 'Gateway:';
-        document.getElementById('lblAutoSplit').textContent = 'Auto Iran Split-Tunneling:';
-        document.getElementById('lblCardUsageTitle').textContent = 'Data Quota & Usage';
-        document.getElementById('lblUpload').textContent = 'Upload:';
-        document.getElementById('lblDownload').textContent = 'Download:';
-        document.getElementById('lblExpiry').textContent = 'Expiration:';
-        document.getElementById('lblCardResilience').textContent = 'Anti-Censorship & Fallback';
-        document.getElementById('lblSplitDns').textContent = 'Split DNS Engine:';
-        document.getElementById('txtSubSectionTitle').textContent = 'Your Smart Subscription Link';
-        document.getElementById('txtSubSectionDesc').textContent = 'Copy this subscription URL into your VPN client app.';
-        document.getElementById('btnCopySubText').textContent = 'Copy Subscription URL';
-        document.getElementById('txtCopiedToast').textContent = 'Copied to clipboard!';
-        document.getElementById('lblManualDownloads').textContent = 'Direct Config Downloads:';
-        document.getElementById('txtQrTitle').textContent = 'Scan QR Code with Phone';
-        document.getElementById('txtQrDesc').textContent = 'Scan this QR code in Hiddify, v2rayNG, Streisand, or V2Box.';
-        document.getElementById('txtGuidesTitle').textContent = 'Step-by-Step Setup Guides';
-        document.getElementById('txtGuidesDesc').textContent = 'Connect in 3 easy steps on your mobile device.';
-        document.getElementById('txtBankingTipTitle').textContent = 'Important note for Iranian banking apps:';
-        document.getElementById('txtBankingTipDesc').textContent = 'All Iranian banking apps, Snapp and .ir domains automatically route direct without VPN. You can also use Per-App Proxy in Hiddify/v2rayNG to bypass banking apps completely.';
-      }} else {{
-        document.title = 'داشبورد کاربری | Home VPN Platform';
-        document.getElementById('txtSubHeader').textContent = 'داشبورد اختصاصی مدیریت اشتراک فیلترشکن';
-        document.getElementById('txtLogout').textContent = 'خروج';
-        document.getElementById('lblCardStatusTitle').textContent = 'وضعیت زنده اتصال';
-        document.getElementById('lblLastSeen').textContent = 'آخرین اتصال:';
-        document.getElementById('lblServerGateway').textContent = 'دروازه سرور:';
-        document.getElementById('lblAutoSplit').textContent = 'تفکیک هوشمند ترافیک ایران:';
-        document.getElementById('lblCardUsageTitle').textContent = 'حجم مصرفی و سقف مجاز';
-        document.getElementById('lblUpload').textContent = 'ارسال:';
-        document.getElementById('lblDownload').textContent = 'دریافت:';
-        document.getElementById('lblExpiry').textContent = 'تاریخ انقضا:';
-        document.getElementById('lblCardResilience').textContent = 'پایداری و مقاومت فیلترینگ';
-        document.getElementById('lblSplitDns').textContent = 'سیستم تفکیک DNS:';
-        document.getElementById('txtSubSectionTitle').textContent = 'لینک هوشمند اشتراک اختصاصی شما';
-        document.getElementById('txtSubSectionDesc').textContent = 'این لینک را کپی کرده و در برنامه فیلترشکن خود اضافه کنید.';
-        document.getElementById('btnCopySubText').textContent = 'کپی لینک اشتراک';
-        document.getElementById('txtCopiedToast').textContent = 'لینک در کلیپ‌بورد کپی شد!';
-        document.getElementById('lblManualDownloads').textContent = 'دانلود مستقیم فایل و کانفیگ‌ها:';
-        document.getElementById('txtQrTitle').textContent = 'اسکن کد QR با دوربین گوشی';
-        document.getElementById('txtQrDesc').textContent = 'در برنامه فیلترشکن علامت اسکن را بزنید و این کد را اسکن کنید.';
-        document.getElementById('txtGuidesTitle').textContent = 'راهنمای راه‌اندازی گام‌به‌گام در گوشی شما';
-        document.getElementById('txtGuidesDesc').textContent = 'یکی از برنامه‌های استاندارد زیر را نصب کرده و وصل شوید.';
-        document.getElementById('txtBankingTipTitle').textContent = 'نکته بسیار مهم برای همراه بانک‌ها، اسنپ و برنامه‌های داخلی:';
-        document.getElementById('txtBankingTipDesc').textContent = 'تمامی سایت‌های ایرانی و بانکی به صورت خودکار بدون فیلترشکن باز می‌شوند. همچنین می‌توانید از گزینه Per-App Proxy برای تفکیک برنامه‌های بانکی استفاده کنید.';
-      }}
-    }}
+      if (userData) updateDisplay();
+    }
 
-    function toggleLang() {{
-      const nextLang = (currentLang === 'fa') ? 'en' : 'fa';
-      setLanguage(nextLang);
-      try {{
-        const url = new URL(window.location);
-        url.searchParams.set('lang', nextLang);
-        window.history.replaceState({{}}, '', url);
-      }} catch (e) {{}}
-    }}
+    function toggleLang() {
+      setLanguage(currentLang === 'fa' ? 'en' : 'fa');
+    }
 
-    function switchAppTab(tab) {{
-      const bAnd = document.getElementById('tabAppAndroid');
-      const bIos = document.getElementById('tabAppIos');
-      const gAnd = document.getElementById('guideAndroid');
-      const gIos = document.getElementById('guideIos');
+    function switchFormat(fmt) {
+      currentFormat = fmt;
+      const btnSingbox = document.getElementById('btnFormatSingbox');
+      const btnVless = document.getElementById('btnFormatVless');
+      if (fmt === 'singbox') {
+        btnSingbox.className = 'flex-1 py-2 rounded-lg font-semibold transition bg-indigo-600 text-white shadow';
+        btnVless.className = 'flex-1 py-2 rounded-lg font-semibold transition text-slate-400 hover:text-white';
+      } else {
+        btnVless.className = 'flex-1 py-2 rounded-lg font-semibold transition bg-indigo-600 text-white shadow';
+        btnSingbox.className = 'flex-1 py-2 rounded-lg font-semibold transition text-slate-400 hover:text-white';
+      }
+      if (userData) updateDisplay();
+    }
 
-      if (tab === 'android') {{
-        bAnd.className = 'flex-1 py-2.5 text-xs font-bold rounded-xl transition bg-indigo-600 text-white shadow-md flex items-center justify-center gap-2';
-        bIos.className = 'flex-1 py-2.5 text-xs font-bold rounded-xl transition text-slate-400 hover:text-white flex items-center justify-center gap-2';
-        gAnd.classList.remove('hidden');
-        gIos.classList.add('hidden');
-      }} else {{
-        bIos.className = 'flex-1 py-2.5 text-xs font-bold rounded-xl transition bg-indigo-600 text-white shadow-md flex items-center justify-center gap-2';
-        bAnd.className = 'flex-1 py-2.5 text-xs font-bold rounded-xl transition text-slate-400 hover:text-white flex items-center justify-center gap-2';
-        gIos.classList.remove('hidden');
-        gAnd.classList.add('hidden');
-      }}
-    }}
+    function getActiveUrl() {
+      if (!userData) return '';
+      return (currentFormat === 'singbox') ? (userData.json_sub_link || userData.smart_sub_link) : (userData.vless_sub_link || userData.smart_sub_link);
+    }
 
-    async function fetchUserData() {{
-      try {{
+    function updateDisplay() {
+      if (!userData) return;
+      const t = i18n[currentLang];
+      const activeUrl = getActiveUrl();
+
+      document.getElementById('valUserEmail').textContent = userData.email || userData.name || 'User';
+      document.getElementById('valDataUsed').textContent = userData.total_used_str || '0 B';
+
+      const limitMbps = userData.bandwidth_limit_mbps;
+      const speedStr = (limitMbps === 0) ? t.unlimited : (limitMbps ? `${limitMbps} Mbps` : '10 Mbps');
+      document.getElementById('txtConnectionStatus').textContent = `${t.activeTier} • ${speedStr}`;
+
+      document.getElementById('inputSubUrl').value = activeUrl;
+      const qrApiUrl = `/api/public/qr?text=${encodeURIComponent(activeUrl)}`;
+      document.getElementById('imgSubQr').src = (currentFormat === 'singbox' && userData.qr_b64) ? userData.qr_b64 : qrApiUrl;
+
+      if (userData.role === 'admin') {
+        const adm = document.getElementById('linkAdmin');
+        if (adm) adm.classList.remove('hidden');
+      }
+    }
+
+    function showToast(msg) {
+      const toast = document.getElementById('toast');
+      toast.textContent = msg;
+      toast.classList.remove('opacity-0');
+      toast.classList.add('opacity-100');
+      setTimeout(() => {
+        toast.classList.remove('opacity-100');
+        toast.classList.add('opacity-0');
+      }, 2500);
+    }
+
+    function copyActiveSubscription() {
+      const url = getActiveUrl();
+      if (!url) return;
+      navigator.clipboard.writeText(url).then(() => {
+        showToast(i18n[currentLang].copied);
+        const btnText = document.getElementById('txtBtnCopySub');
+        const orig = btnText.textContent;
+        btnText.textContent = (currentLang === 'fa' ? '✓ کپی شد!' : '✓ Copied!');
+        setTimeout(() => { btnText.textContent = orig; }, 2000);
+      }).catch(() => {
+        const inp = document.getElementById('inputSubUrl');
+        inp.select();
+        document.execCommand('copy');
+        showToast(i18n[currentLang].copied);
+      });
+    }
+
+    function openDirectDomainsModal() {
+      document.getElementById('directRoutingModal').classList.remove('hidden');
+    }
+
+    function closeDirectDomainsModal() {
+      document.getElementById('directRoutingModal').classList.add('hidden');
+    }
+
+    async function loadData() {
+      try {
         const res = await fetch('/api/user/me');
-        if (res.status === 401) {{
-          window.location.href = '/?mode=login';
+        if (res.status === 401) {
+          window.location.href = '/login';
           return;
-        }}
-        const d = await res.json();
+        }
+        userData = await res.json();
+        updateDisplay();
+      } catch (e) {
+        console.error('Error fetching user info:', e);
+      }
+    }
 
-        // Greeting
-        document.getElementById('txtUserGreeting').textContent = currentLang === 'fa' ? `سلام، ${{d.name || d.email}}` : `Hello, ${{d.name || d.email}}`;
-        if (d.role === 'admin') {{
-          document.getElementById('linkAdmin').classList.remove('hidden');
-        }}
-
-        // Online Badge
-        const badge = document.getElementById('badgeOnlineHeader');
-        const txtOnline = document.getElementById('txtOnlineHeader');
-        const statusDot = document.getElementById('statusDot');
-        const txtLive = document.getElementById('txtLiveStatus');
-
-        if (d.is_online) {{
-          badge.className = 'px-2 py-0.5 text-[10px] rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 flex items-center gap-1';
-          txtOnline.textContent = currentLang === 'fa' ? 'آنلاین / متصل' : 'Online / Connected';
-          statusDot.className = 'w-3.5 h-3.5 rounded-full bg-emerald-400 animate-ping';
-          txtLive.textContent = currentLang === 'fa' ? '🟢 متصل و آنلاین' : '🟢 Online & Connected';
-          txtLive.className = 'text-lg font-bold text-emerald-400';
-        }} else {{
-          badge.className = 'px-2 py-0.5 text-[10px] rounded-full bg-slate-800 text-slate-400 border border-slate-700 flex items-center gap-1';
-          txtOnline.textContent = currentLang === 'fa' ? 'آفلاین' : 'Offline';
-          statusDot.className = 'w-3.5 h-3.5 rounded-full bg-slate-500';
-          txtLive.textContent = currentLang === 'fa' ? '⚪ آفلاین' : '⚪ Offline';
-          txtLive.className = 'text-lg font-bold text-slate-400';
-        }}
-
-        document.getElementById('valLastSeen').textContent = currentLang === 'fa' ? d.last_seen_fa : d.last_seen_en;
-
-        // Quota
-        document.getElementById('valTotalUsed').textContent = d.total_used_str;
-        document.getElementById('valLimit').textContent = (currentLang === 'fa' ? 'سقف: ' : 'Limit: ') + d.limit_str;
-        document.getElementById('valUpload').textContent = d.up_str;
-        document.getElementById('valDownload').textContent = d.down_str;
-        document.getElementById('valExpiry').textContent = d.expiry_str;
-
-        const pct = Math.min(100, Math.max(3, d.percent_used || 0));
-        const bar = document.getElementById('usageBar');
-        bar.style.width = pct + '%';
-        if (pct >= 85) {{
-          bar.className = 'bg-gradient-to-r from-amber-500 to-rose-500 h-2.5 rounded-full transition-all duration-500';
-        }} else {{
-          bar.className = 'bg-gradient-to-r from-indigo-500 to-cyan-400 h-2.5 rounded-full transition-all duration-500';
-        }}
-
-        // Links & QR Code
-        mySubUrl = d.smart_sub_link;
-        myFarsiGuide = d.farsi_instructions;
-        document.getElementById('inputSubUrl').value = d.smart_sub_link;
-        document.getElementById('imgQrCode').src = 'data:image/png;base64,' + d.qr_b64;
-        document.getElementById('btnDownloadJson').href = d.json_sub_link;
-        document.getElementById('btnDownloadVless').href = d.vless_sub_link;
-
-      }} catch (err) {{
-        console.error('Fetch user data error:', err);
-      }}
-    }}
-
-    function copySubUrl() {{
-      const el = document.getElementById('inputSubUrl');
-      el.select();
-      navigator.clipboard.writeText(el.value).then(() => {{
-        const toast = document.getElementById('copyToast');
-        toast.classList.remove('hidden');
-        setTimeout(() => {{ toast.classList.add('hidden'); }}, 3000);
-      }});
-    }}
-
-    function copyFarsiGuide() {{
-      if (myFarsiGuide) {{
-        navigator.clipboard.writeText(myFarsiGuide).then(() => {{
-          alert(currentLang === 'fa' ? 'متن راهنما کپی شد! می‌توانید آن را در واتساپ یا تلگرام برای دیگران بفرستید.' : 'Guide copied to clipboard!');
-        }});
-      }}
-    }}
-
-    window.addEventListener('DOMContentLoaded', () => {{
-      const urlParams = new URLSearchParams(window.location.search);
-      const qLang = urlParams.get('lang');
-      if (qLang && (qLang === 'en' || qLang === 'fa')) {{
-        currentLang = qLang;
-        localStorage.setItem('vpn_lang', qLang);
-      }} else {{
-        currentLang = localStorage.getItem('vpn_lang') || 'fa';
-      }}
-      setLanguage(currentLang);
-      fetchUserData();
-      setInterval(fetchUserData, 10000);
-    }});
+    setLanguage(currentLang);
+    loadData();
+    setInterval(loadData, 20000);
   </script>
 </body>
-</html>"""
+</html>""".replace("__COMMON_HEADER__", COMMON_HEADER_HTML)
 
-# ----------------- 3. ADMIN DASHBOARD WITH BIRD'S-EYE OVERVIEW & ONE-CLICK BYPASS ----------------- #
-
-ADMIN_PAGE_HTML = f"""<!DOCTYPE html>
+ADMIN_PAGE_HTML = """<!DOCTYPE html>
 <html lang="fa" dir="rtl" class="dark">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title id="docTitle">مرکز مدیریت فیلترشکن خانواده | Admin Control Center</title>
-  {COMMON_HEADER_HTML}
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <title id="docTitle">مرکز مدیریت فیلترشکن خانواده | Family VPN Admin</title>
+  __COMMON_HEADER__
 </head>
-<body class="bg-slate-950 text-slate-100 min-h-screen selection:bg-indigo-500 selection:text-white flex flex-col justify-between">
+<body class="bg-[#0B0F19] text-slate-100 min-h-screen selection:bg-indigo-500 selection:text-white flex flex-col justify-between antialiased">
   
   <!-- Navigation Header -->
-  <header class="border-b border-slate-800/80 bg-slate-900/60 sticky top-0 z-40 backdrop-blur-md">
-    <div class="max-w-7xl mx-auto px-4 h-16 flex items-center justify-between gap-4">
+  <header class="border-b border-white/[0.08] bg-[#0B0F19]/80 sticky top-0 z-40 backdrop-blur-md">
+    <div class="max-w-6xl mx-auto px-4 h-16 flex items-center justify-between">
       <div class="flex items-center gap-3">
-        <div class="p-2.5 rounded-2xl bg-gradient-to-tr from-indigo-600 via-indigo-500 to-cyan-400 text-white shadow-lg shadow-indigo-500/25 shrink-0">
-          <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg>
+        <div class="w-8 h-8 rounded-xl bg-indigo-600 flex items-center justify-center text-white shadow-sm font-bold text-xs tracking-wider">
+          ADM
         </div>
         <div>
-          <div class="flex items-center gap-2">
-            <h1 class="font-extrabold text-sm sm:text-base tracking-tight text-white leading-none">
-              <span id="txtAdminTitle">مرکز مدیریت فیلترشکن خانواده</span>
-            </h1>
-            <span id="txtAdminRoleBadge" class="px-2 py-0.5 text-[10px] rounded-full bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">مدیر سیستم (Tohid)</span>
-          </div>
-          <p id="txtAdminSub" class="text-xs text-slate-400 mt-0.5">دید پرنده، مدیریت کاربران، و بای‌پس تک‌کلیک دامنه‌ها</p>
+          <span class="font-bold text-sm sm:text-base text-white tracking-tight" id="txtHeaderTitle">مرکز مدیریت فیلترشکن خانواده</span>
         </div>
       </div>
 
-      <div class="flex items-center gap-2 sm:gap-2.5 flex-wrap justify-end">
-        <!-- Direct Domains Modal Button -->
-        <button onclick="openDomainsModal()" class="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200 border border-slate-700 transition flex items-center gap-1.5 shadow-sm">
-          <svg class="w-4 h-4 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3.055 11H5a2 2 0 012 2v1a2 2 0 002 2 2 2 0 012 2v2.945M8 3.935V5.5A2.5 2.5 0 0010.5 8h.5a2 2 0 012 2 2 2 0 104 0 2 2 0 012-2h1.064M15 20.488V18a2 2 0 012-2h3.064"/></svg>
-          <span id="txtBtnDomains">دامنه‌های مستقیم</span>
-        </button>
-
-        <!-- Telegram Config Modal Button -->
-        <button onclick="openTelegramModal()" class="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200 border border-slate-700 transition flex items-center gap-1.5 shadow-sm">
-          <svg class="w-4 h-4 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"/></svg>
-          <span id="txtBtnTelegram">هشدار تلگرام</span>
-        </button>
-
-        <!-- Backup & Restore Button -->
-        <button onclick="openBackupModal()" class="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200 border border-slate-700 transition flex items-center gap-1.5 shadow-sm">
-          <svg class="w-4 h-4 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4"/></svg>
-          <span id="txtBtnBackup">پشتیبان‌گیری</span>
-        </button>
-
-        <!-- Help & Guide Link -->
-        <a href="/help" target="_blank" class="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200 border border-slate-700 transition flex items-center gap-1.5 shadow-sm">
-          <svg class="w-4 h-4 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253"/></svg>
-          <span id="txtBtnHelp">راهنما</span>
+      <!-- Essential Nav Links Only -->
+      <div class="flex items-center gap-2 sm:gap-3 text-xs">
+        <a href="/admin" class="px-3 py-1.5 rounded-lg text-slate-200 hover:text-white hover:bg-white/[0.05] transition font-medium">
+          <span id="navDash">داشبورد</span>
         </a>
-
-        <!-- Diagnostics Modal Button -->
-        <button onclick="openDiagModal()" class="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200 border border-slate-700 transition flex items-center gap-1.5 shadow-sm">
-          <svg class="w-4 h-4 text-amber-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
-          <span id="txtBtnDiag">عیب‌یابی</span>
-        </button>
-
-        <!-- Theme Toggle -->
-        <button onclick="toggleTheme()" class="px-2.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 transition" title="Toggle Theme">
-          <svg class="w-4 h-4 text-amber-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"/></svg>
-        </button>
-
-        <!-- Language Switcher Button -->
-        <button id="btnLangToggle" onclick="toggleLang()" class="px-3.5 py-1.5 rounded-xl bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/40 text-xs font-bold transition flex items-center gap-1.5 shadow-sm">
-          <svg class="w-4 h-4 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 5h12M9 3v2m1.048 9.5A18.022 18.022 0 016.412 9m6.088 9h7M11 21l5-10 5 10M12.751 5C11.783 10.77 8.07 15.61 3 18.129"/></svg>
+        <a href="#direct" onclick="switchAdminTab('domains')" class="px-3 py-1.5 rounded-lg text-slate-300 hover:text-white hover:bg-white/[0.05] transition font-medium">
+          <span id="navDirect">مسیر مستقیم</span>
+        </a>
+        <a href="/help" target="_blank" class="px-3 py-1.5 rounded-lg text-slate-300 hover:text-white hover:bg-white/[0.05] transition font-medium">
+          <span id="navHelp">راهنما</span>
+        </a>
+        <button onclick="toggleLang()" class="px-2.5 py-1.5 rounded-lg text-slate-300 hover:text-white hover:bg-white/[0.05] transition font-semibold">
           <span id="langSwitchLabel">English</span>
         </button>
-
-        <!-- Logout -->
-        <a href="/logout" id="txtAdminLogout" class="px-3 py-1.5 rounded-xl bg-rose-950/60 hover:bg-rose-900/80 text-rose-300 border border-rose-800/80 text-xs font-semibold transition">خروج</a>
+        <button onclick="toggleTheme()" class="p-1.5 rounded-lg text-slate-300 hover:text-white hover:bg-white/[0.05] transition" title="Toggle Theme">
+          <svg class="w-4 h-4 text-amber-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"/></svg>
+        </button>
+        <a href="/dashboard" class="px-2.5 py-1.5 rounded-lg bg-indigo-600/20 text-indigo-300 hover:bg-indigo-600/30 transition font-medium">
+          <span id="navUserPortal">پرتال کاربر</span>
+        </a>
+        <a href="/logout" class="px-2.5 py-1.5 rounded-lg text-rose-400 hover:bg-rose-500/10 transition font-medium">
+          <span id="navLogout">خروج</span>
+        </a>
       </div>
     </div>
   </header>
 
   <!-- Main Content -->
-  <main class="max-w-7xl mx-auto px-4 py-8 flex-1 w-full space-y-8">
+  <main class="max-w-6xl mx-auto px-4 py-8 flex-1 w-full space-y-7">
     
-    <!-- Prominent Connection & Sharing Status Banner -->
-    <div class="glass-card p-6 rounded-3xl border border-indigo-900/60 bg-gradient-to-r from-slate-900/90 via-indigo-950/40 to-slate-900/90 shadow-2xl space-y-4">
-      <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 border-b border-slate-800/80 pb-3">
-        <div class="flex items-center gap-2.5">
-          <div class="p-2 rounded-xl bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">
-            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"/></svg>
+    <!-- Top Hero Bar (3 Clean Metrics Only) -->
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-5">
+      
+      <!-- 1. Active Users Online -->
+      <div class="glass-card p-6 rounded-3xl space-y-2 flex flex-col justify-between">
+        <div class="text-[11px] font-bold text-slate-400 uppercase tracking-wider flex items-center justify-between">
+          <span id="heroOnlineTitle">کاربران آنلاین</span>
+          <span class="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></span>
+        </div>
+        <div class="flex items-baseline gap-2 mt-1">
+          <span id="heroOnlineCount" class="text-3xl font-extrabold text-white">0</span>
+          <span class="text-xs text-emerald-400 font-semibold" id="heroOnlineLabel">آنلاین</span>
+        </div>
+        <p id="heroOnlineSub" class="text-xs text-slate-500 pt-1 border-t border-white/[0.04]">مجموع ۰ کاربر خانواده ثبت‌نام شده</p>
+      </div>
+
+      <!-- 2. Live Public URL -->
+      <div class="glass-card p-6 rounded-3xl space-y-2 flex flex-col justify-between">
+        <div class="text-[11px] font-bold text-slate-400 uppercase tracking-wider flex items-center justify-between">
+          <span id="heroUrlTitle">آدرس عمومی پرتال</span>
+          <span class="text-[10px] text-emerald-400 font-mono">TLS / HTTP2</span>
+        </div>
+        <div id="heroPublicUrl" class="font-mono text-xs text-indigo-300 truncate select-all ltr-only mt-1">
+          در حال اتصال تونل...
+        </div>
+        <div class="flex items-center gap-2 pt-2 border-t border-white/[0.04]">
+          <button onclick="copyPublicUrl()" class="px-2.5 py-1 rounded-lg bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/30 text-xs font-semibold transition" id="btnHeroCopy">
+            کپی لینک
+          </button>
+          <button onclick="shareViaWhatsApp()" class="px-2.5 py-1 rounded-lg bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/30 text-xs font-semibold transition" id="btnHeroShareWA">
+            واتس‌اپ
+          </button>
+          <button onclick="shareViaTelegram()" class="px-2.5 py-1 rounded-lg bg-sky-600/20 hover:bg-sky-600/30 text-sky-300 border border-sky-500/30 text-xs font-semibold transition" id="btnHeroShareTG">
+            تلگرام
+          </button>
+          <button onclick="openPortalQrModal()" class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-white/[0.08] text-xs font-semibold transition">
+            QR
+          </button>
+        </div>
+      </div>
+
+      <!-- 3. Invite Code with Inline Edit -->
+      <div class="glass-card p-6 rounded-3xl space-y-2 flex flex-col justify-between">
+        <div class="text-[11px] font-bold text-slate-400 uppercase tracking-wider flex items-center justify-between">
+          <span id="heroInviteTitle">کد دعوت خانواده</span>
+          <button onclick="toggleEditInvite()" class="text-xs text-indigo-400 hover:text-indigo-300 font-semibold" id="btnEditInvite">
+            ویرایش
+          </button>
+        </div>
+        <div id="inviteDisplayWrap" class="flex items-center justify-between mt-1">
+          <span id="heroInviteCode" class="text-2xl font-mono font-extrabold text-white tracking-widest">TOHID</span>
+          <button onclick="copyInviteCode()" class="text-xs text-slate-300 hover:text-white px-2.5 py-1 rounded-lg bg-white/[0.05] border border-white/[0.08]" id="btnCopyInvite">کپی</button>
+        </div>
+        <div id="inviteEditWrap" class="hidden flex items-center gap-2 mt-1">
+          <input type="text" id="inputNewInvite" class="w-full px-3 py-1.5 rounded-lg bg-slate-950 border border-indigo-500/50 text-white font-mono text-sm focus:outline-none">
+          <button onclick="saveNewInvite()" class="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs">ذخیره</button>
+          <button onclick="cancelEditInvite()" class="px-2 py-1.5 text-xs text-slate-400 hover:text-white">انصراف</button>
+        </div>
+        <p id="heroInviteSub" class="text-xs text-slate-500 pt-1 border-t border-white/[0.04]">الزامی برای ثبت‌نام اعضای خانواده</p>
+      </div>
+
+    </div>
+
+    <!-- Clean User Table Card -->
+    <div class="glass-card rounded-3xl p-6 space-y-5">
+      <div class="flex items-center justify-between flex-wrap gap-4">
+        <div>
+          <h2 class="text-base font-bold text-white tracking-tight" id="tblTitle">کاربران و اشتراک‌های خانواده</h2>
+          <p class="text-xs text-slate-400" id="tblSub">کنترل سقف سرعت هر کاربر، مشاهده حجم مصرفی و صدور لینک</p>
+        </div>
+        <button onclick="openModal('addMemberModal')" class="px-3.5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs transition shadow-lg shadow-indigo-600/20 flex items-center gap-1.5" id="btnAddMember">
+          + تعریف عضو جدید
+        </button>
+      </div>
+
+      <!-- Table Container -->
+      <div class="overflow-x-auto rounded-2xl border border-white/[0.06]">
+        <table class="w-full text-xs text-slate-300">
+          <thead class="bg-white/[0.02] border-b border-white/[0.06] text-slate-400 font-semibold uppercase tracking-wider text-[11px]">
+            <tr>
+              <th class="p-3.5 text-start" id="thUser">کاربر / ایمیل</th>
+              <th class="p-3.5 text-center" id="thStatus">وضعیت</th>
+              <th class="p-3.5 text-start" id="thUsage">حجم مصرفی</th>
+              <th class="p-3.5 text-center" id="thSpeed">سقف سرعت</th>
+              <th class="p-3.5 text-center" id="thActions">عملیات</th>
+            </tr>
+          </thead>
+          <tbody id="clientsTableBody" class="divide-y divide-white/[0.04]">
+            <tr>
+              <td colspan="5" class="p-8 text-center text-slate-500">در حال بارگذاری کاربران...</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Collapsible Secondary Tools Drawers / Tabs -->
+    <div class="space-y-4">
+      <!-- Pill Tabs Bar -->
+      <div class="flex items-center gap-2 overflow-x-auto pb-1 text-xs">
+        <button onclick="switchAdminTab('none')" id="tabBtnNone" class="px-3 py-1.5 rounded-lg text-slate-400 hover:text-white transition font-medium">
+          بستن ابزارها
+        </button>
+        <button onclick="switchAdminTab('cf')" id="tabBtnCf" class="px-3.5 py-1.5 rounded-lg bg-white/[0.05] hover:bg-white/[0.08] text-slate-300 hover:text-white transition font-medium flex items-center gap-1.5">
+          <span>⚡ بهینه‌ساز IP کلودفلر</span>
+        </button>
+        <button onclick="switchAdminTab('telegram')" id="tabBtnTg" class="px-3.5 py-1.5 rounded-lg bg-white/[0.05] hover:bg-white/[0.08] text-slate-300 hover:text-white transition font-medium flex items-center gap-1.5">
+          <span>🔔 هشدارهای تلگرام</span>
+        </button>
+        <button onclick="switchAdminTab('domains')" id="tabBtnDom" class="px-3.5 py-1.5 rounded-lg bg-white/[0.05] hover:bg-white/[0.08] text-slate-300 hover:text-white transition font-medium flex items-center gap-1.5">
+          <span>🌐 دامنه‌های مستقیم ایران</span>
+        </button>
+        <button onclick="switchAdminTab('backup')" id="tabBtnBkp" class="px-3.5 py-1.5 rounded-lg bg-white/[0.05] hover:bg-white/[0.08] text-slate-300 hover:text-white transition font-medium flex items-center gap-1.5">
+          <span>💾 پشتیبان‌گیری</span>
+        </button>
+        <button onclick="switchAdminTab('diag')" id="tabBtnDiag" class="px-3.5 py-1.5 rounded-lg bg-white/[0.05] hover:bg-white/[0.08] text-slate-300 hover:text-white transition font-medium flex items-center gap-1.5">
+          <span>📋 لاگ‌ها و عیب‌یابی</span>
+        </button>
+      </div>
+
+      <!-- Tab 1: Edge IP Optimizer -->
+      <div id="panelCf" class="hidden glass-card rounded-3xl p-6 space-y-4">
+        <div class="flex items-center justify-between">
+          <h3 class="font-bold text-sm text-white" id="cfOptTitle">بهینه‌ساز خودکار Clean IP کلودفلر</h3>
+          <span class="text-xs text-indigo-400 font-mono" id="cfActiveIpDisplay">Active: 104.21.32.189</span>
+        </div>
+        <p class="text-xs text-slate-300 leading-relaxed" id="cfOptDesc">
+          اسکن خودکار ۲۴ سرور Anycast کلودفلر جهت انتخاب سریع‌ترین IP تمیز برای کانفیگ‌های خانواده با کمترین پینگ.
+        </p>
+        <div class="flex items-center gap-3 pt-2">
+          <button onclick="triggerCfScan()" id="btnCfScan" class="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs transition">
+            اسکن و ارتقای فوری
+          </button>
+          <span id="cfScanStatus" class="text-xs text-slate-400"></span>
+        </div>
+      </div>
+
+      <!-- Tab 2: Telegram Alerts -->
+      <div id="panelTg" class="hidden glass-card rounded-3xl p-6 space-y-4">
+        <div class="flex items-center justify-between">
+          <h3 class="font-bold text-sm text-white" id="tgTitle">تنظیمات ربات تلگرام</h3>
+          <button onclick="saveTelegramConfig()" class="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold">ذخیره</button>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+          <div>
+            <label class="block text-slate-400 mb-1">Bot Token</label>
+            <input type="text" id="tgTokenInput" class="w-full px-3 py-2 rounded-lg bg-slate-950 border border-white/[0.08] text-white font-mono text-xs">
           </div>
           <div>
-            <h3 id="txtConnStatusTitle" class="text-base font-extrabold text-white">وضعیت دسترسی و اشتراک‌گذاری سراسری</h3>
-            <p id="txtConnStatusSub" class="text-xs text-slate-400">آدرس‌های پورتال برای دسترسی محلی در خانه و اشتراک‌گذاری امن از راه دور</p>
+            <label class="block text-slate-400 mb-1">Chat ID</label>
+            <input type="text" id="tgChatIdInput" class="w-full px-3 py-2 rounded-lg bg-slate-950 border border-white/[0.08] text-white font-mono text-xs">
           </div>
         </div>
-
-        <!-- Action buttons: WhatsApp & Telegram sharing & QR -->
-        <div class="flex items-center gap-2 flex-wrap">
-          <button onclick="shareViaWhatsApp()" class="px-3.5 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold transition flex items-center gap-1.5 shadow-sm shadow-emerald-600/30">
-            <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M.057 24l1.687-6.163c-1.041-1.804-1.588-3.849-1.587-5.946.003-6.556 5.338-11.891 11.893-11.891 3.181.001 6.167 1.24 8.413 3.488 2.245 2.248 3.481 5.236 3.48 8.414-.003 6.557-5.338 11.892-11.893 11.892-1.99-.001-3.951-.5-5.688-1.448l-6.305 1.654zm6.597-3.807c1.676.995 3.276 1.591 5.392 1.592 5.448 0 9.886-4.434 9.889-9.885.002-5.462-4.415-9.89-9.881-9.892-5.452 0-9.887 4.434-9.889 9.884-.001 2.225.651 3.891 1.746 5.634l-.999 3.648 3.742-.981z"/></svg>
-            <span id="btnShareWhatsApp">اشتراک با واتس‌اپ</span>
-          </button>
-          <button onclick="shareViaTelegram()" class="px-3.5 py-1.5 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-xs font-bold transition flex items-center gap-1.5 shadow-sm shadow-sky-600/30">
-            <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M12 0c-6.627 0-12 5.373-12 12s5.373 12 12 12 12-5.373 12-12-5.373-12-12-12zm5.894 8.221l-1.97 9.28c-.145.658-.537.818-1.084.508l-3-2.21-1.446 1.394c-.14.18-.357.295-.6.295-.002 0-.003 0-.005 0l.213-3.054 5.56-5.022c.24-.213-.054-.334-.373-.121l-6.869 4.326-2.96-.924c-.643-.204-.657-.643.136-.953l11.57-4.461c.536-.195 1.006.128.832.942z"/></svg>
-            <span id="btnShareTelegram">اشتراک با تلگرام</span>
-          </button>
-          <button onclick="openPortalQrModal()" class="px-3.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-xs font-semibold transition flex items-center gap-1.5">
-            <svg class="w-4 h-4 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v1m6 11h2m-6 0h-2v4m0-11v3m0 0h.01M12 12h4.01M16 20h4M4 12h4m12 0h.01M5 8h2a1 1 0 001-1V5a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1zm12 0h2a1 1 0 001-1V5a1 1 0 00-1-1h-2a1 1 0 00-1 1v2a1 1 0 001 1zM5 20h2a1 1 0 001-1v-2a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1z"/></svg>
-            <span id="btnPortalQr">بارکد QR</span>
-          </button>
-        </div>
-      </div>
-
-      <!-- 3 Connection Cards: Local, LAN, Public -->
-      <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
-        <!-- Localhost -->
-        <div class="p-3.5 rounded-2xl bg-slate-900/60 border border-slate-800 space-y-1">
-          <div class="flex items-center justify-between">
-            <span id="lblLocalHostTitle" class="text-[11px] font-bold text-slate-400">آدرس محلی روی این لپ‌تاپ:</span>
-            <button onclick="copyToClipboard(currentLocalUrl, 'btnCopyLocal')" id="btnCopyLocal" class="text-[10px] text-indigo-400 hover:text-indigo-300 font-bold">کپی</button>
-          </div>
-          <div id="valLocalUrl" class="font-mono text-xs text-indigo-300 truncate ltr-only">http://127.0.0.1:8080</div>
-          <div id="subLocalHost" class="text-[10px] text-slate-500">مخصوص مرورگر همین دستگاه</div>
-        </div>
-
-        <!-- Home Wi-Fi LAN -->
-        <div class="p-3.5 rounded-2xl bg-slate-900/60 border border-slate-800 space-y-1">
-          <div class="flex items-center justify-between">
-            <span id="lblLanTitle" class="text-[11px] font-bold text-slate-400">آدرس وای‌فای خانگی (LAN):</span>
-            <button onclick="copyToClipboard(currentLanUrl, 'btnCopyLan')" id="btnCopyLan" class="text-[10px] text-cyan-400 hover:text-cyan-300 font-bold">کپی</button>
-          </div>
-          <div id="valLanUrl" class="font-mono text-xs text-cyan-300 truncate ltr-only">http://192.168.1.x:8080</div>
-          <div id="subLanTitle" class="text-[10px] text-slate-500">برای گوشی‌های متصل به همین وای‌فای</div>
-        </div>
-
-        <!-- Public Cloudflare Tunnel -->
-        <div class="p-3.5 rounded-2xl bg-slate-900/60 border border-slate-800 space-y-1">
-          <div class="flex items-center justify-between">
-            <span id="lblPublicTunnelTitle" class="text-[11px] font-bold text-slate-400">آدرس عمومی اینترنت (تونل ابری):</span>
-            <button onclick="copyToClipboard(currentPublicUrl, 'btnCopyPublic')" id="btnCopyPublic" class="text-[10px] text-emerald-400 hover:text-emerald-300 font-bold">کپی</button>
-          </div>
-          <div id="valPublicUrl" class="font-mono text-xs text-emerald-300 truncate ltr-only">https://*.trycloudflare.com</div>
-          <div id="subPublicTunnel" class="text-[10px] text-emerald-400/80">قابل دسترسی از سراسر دنیا و ایران</div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Top Summary KPI Cards -->
-    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-5">
-      
-      <!-- KPI 1: Total Users -->
-      <div class="glass-card p-5 rounded-3xl border border-slate-800 shadow-xl flex items-center justify-between">
-        <div>
-          <span id="kpiLblTotalUsers" class="text-xs font-bold text-slate-400 uppercase tracking-wider block">کل کاربران خانواده</span>
-          <span id="kpiValTotalUsers" class="text-3xl font-extrabold text-white mt-1 block">0</span>
-          <span id="kpiSubTotalUsers" class="text-[11px] text-slate-500">حساب‌های فعال در سرور</span>
-        </div>
-        <div class="p-3 rounded-2xl bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 shrink-0">
-          <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z"/></svg>
-        </div>
-      </div>
-
-      <!-- KPI 2: Online Users -->
-      <div class="glass-card p-5 rounded-3xl border border-slate-800 shadow-xl flex items-center justify-between">
-        <div>
-          <span id="kpiLblOnline" class="text-xs font-bold text-slate-400 uppercase tracking-wider block">کاربران آنلاین در این لحظه</span>
-          <div class="flex items-center gap-2 mt-1">
-            <span id="kpiValOnline" class="text-3xl font-extrabold text-emerald-400">0</span>
-            <span class="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-ping"></span>
-          </div>
-          <span id="kpiSubOnline" class="text-[11px] text-emerald-400/80">ترافیک زنده ۱۵ دقیقه اخیر</span>
-        </div>
-        <div class="p-3 rounded-2xl bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 shrink-0">
-          <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.111 16.404a5.5 5.5 0 017.778 0M12 20h.01m-7.08-7.071c3.904-3.905 10.236-3.905 14.141 0M1.394 9.393c5.857-5.857 15.355-5.857 21.213 0"/></svg>
-        </div>
-      </div>
-
-      <!-- KPI 3: Bandwidth -->
-      <div class="glass-card p-5 rounded-3xl border border-slate-800 shadow-xl flex items-center justify-between">
-        <div>
-          <span id="kpiLblBandwidth" class="text-xs font-bold text-slate-400 uppercase tracking-wider block">مجموع ترافیک خانواده</span>
-          <span id="kpiValBandwidth" class="text-3xl font-extrabold text-cyan-400 mt-1 block">0 B</span>
-          <div class="text-[11px] text-slate-400 flex gap-2 font-mono mt-0.5">
-            <span>↑ <span id="kpiValUp">0 B</span></span>
-            <span>↓ <span id="kpiValDown">0 B</span></span>
-          </div>
-        </div>
-        <div class="p-3 rounded-2xl bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 shrink-0">
-          <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
-        </div>
-      </div>
-
-      <!-- KPI 4: Watchdog Health -->
-      <div class="glass-card p-5 rounded-3xl border border-slate-800 shadow-xl flex items-center justify-between">
-        <div>
-          <span id="kpiLblWatchdog" class="text-xs font-bold text-slate-400 uppercase tracking-wider block">سیستم خودترمیمی و تونل</span>
-          <span id="kpiValWatchdog" class="text-sm font-bold text-emerald-400 mt-1 block">Healthy & Active</span>
-          <span id="kpiSubWatchdog" class="text-[11px] text-slate-500 font-mono">Cloudflare Quick Tunnel</span>
-        </div>
-        <div class="p-3 rounded-2xl bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 shrink-0">
-          <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
-        </div>
-      </div>
-
-    </div>
-
-    <!-- Shareable Family Invite Code Card -->
-    <div class="glass-card p-6 rounded-3xl border border-indigo-900/60 bg-gradient-to-r from-indigo-950/60 via-slate-900/80 to-slate-900/60 shadow-2xl flex flex-col md:flex-row items-center justify-between gap-5">
-      <div class="space-y-1.5 text-start w-full">
-        <div class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-indigo-600/20 text-indigo-300 border border-indigo-500/30 text-[11px] font-bold">
-          <span id="txtInviteBadge">کد دعوت فعال خانواده</span>
-        </div>
-        <h3 class="text-lg font-bold text-white flex items-center gap-2">
-          <span id="lblInviteTitle">کد دعوت:</span>
-          <span id="txtCurrentInviteCode" class="font-mono text-xl text-indigo-300 bg-indigo-950/90 px-3 py-0.5 rounded-xl border border-indigo-700/60">IR-FAMILY</span>
-          <button id="btnEditInvite" onclick="editInviteCode()" class="text-xs text-indigo-400 hover:text-indigo-200 underline font-normal">ویرایش</button>
-        </h3>
-        <p id="txtInviteDesc" class="text-xs text-slate-300 max-w-2xl leading-relaxed">این لینک و کد را برای اعضای خانواده بفرستید تا بتوانند مستقیماً از گوشی ثبت‌نام کرده و اشتراک هوشمند دریافت کنند.</p>
-      </div>
-
-      <div class="flex items-center gap-2.5 w-full md:w-auto shrink-0">
-        <button onclick="copyShareableInviteLink()" class="w-full md:w-auto px-5 py-3 rounded-2xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs shadow-lg shadow-indigo-600/30 transition flex items-center justify-center gap-2">
-          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
-          <span id="btnCopyInviteText">کپی لینک دعوت و متن آماده</span>
-        </button>
-      </div>
-    </div>
-
-    <!-- Automated Cloudflare Clean Edge IP & Speed Optimizer Card -->
-    <div class="glass-card p-6 rounded-3xl border border-cyan-900/60 bg-gradient-to-r from-cyan-950/60 via-slate-900/80 to-slate-900/60 shadow-2xl flex flex-col md:flex-row items-center justify-between gap-5">
-      <div class="space-y-2 text-start w-full">
-        <div class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-cyan-600/20 text-cyan-300 border border-cyan-500/30 text-[11px] font-bold">
-          <span id="txtCfIpBadge">بهینه‌سازی خودکار سرعت و Clean Edge IP</span>
-        </div>
-        <h3 class="text-lg font-bold text-white flex items-center gap-2 flex-wrap">
-          <span id="lblCfIpTitle">آی‌پی کلودفلر فعال (پروفایل ۱):</span>
-          <span id="txtActiveCfIp" class="font-mono text-base text-cyan-300 bg-cyan-950/90 px-3 py-0.5 rounded-xl border border-cyan-700/60">104.16.132.229</span>
-          <span id="txtCfIpType" class="text-[10px] text-emerald-300 bg-emerald-950/80 px-2 py-0.5 rounded-lg border border-emerald-700/60 font-semibold">ارتقای خودکار</span>
-          <span id="txtCfLatency" class="text-[10px] text-cyan-300 bg-cyan-950/80 px-2 py-0.5 rounded-lg border border-cyan-700/60 font-mono">-- ms</span>
-        </h3>
-        <p id="txtCfIpDesc" class="text-xs text-slate-300 max-w-2xl leading-relaxed">اسکنر هوشمند هر ۱۵ دقیقه پینگ و پایداری ۲۴ آی‌پی Anycast کلودفلر را بررسی کرده و سریع‌ترین آی‌پی را به عنوان پروفایل شماره ۱ به اشتراک‌های خانواده ارتقا می‌دهد.</p>
-        <div class="flex items-center gap-4 pt-1 text-[11px] text-slate-400 flex-wrap">
-          <label class="flex items-center gap-2 cursor-pointer select-none">
-            <input type="checkbox" id="chkCfAutoOptimize" onchange="toggleCfAutoOptimize(this.checked)" class="w-4 h-4 rounded text-cyan-500 bg-slate-900 border-slate-700 focus:ring-cyan-500" checked>
-            <span id="lblAutoOptimizeText" class="text-slate-200 font-semibold">بهینه‌سازی خودکار (هر ۱۵ دقیقه)</span>
+        <div class="flex items-center gap-3 pt-1">
+          <label class="inline-flex items-center gap-2 text-xs text-slate-300 cursor-pointer">
+            <input type="checkbox" id="tgEnabledCheckbox" class="rounded bg-slate-900 border-white/[0.1] text-indigo-600">
+            <span>فعال‌سازی ارسال اعلان‌های تلگرام</span>
           </label>
-          <span class="text-slate-600">|</span>
-          <div class="flex items-center gap-1">
-            <span id="lblLastScanText">آخرین اسکن:</span>
-            <span id="txtCfLastScan" class="font-mono text-cyan-400">Never</span>
-          </div>
+          <button onclick="testTelegramAlert()" class="px-3 py-1.5 rounded-lg bg-white/[0.05] hover:bg-white/[0.1] text-slate-300 text-xs font-semibold">تست ارسال پیام</button>
+          <span id="tgTestStatus" class="text-xs text-slate-400"></span>
         </div>
       </div>
 
-      <div class="flex flex-col sm:flex-row items-center gap-2.5 w-full md:w-auto shrink-0">
-        <button id="btnScanNow" onclick="triggerCfScanNow()" class="w-full sm:w-auto px-4 py-2.5 rounded-2xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs shadow-lg shadow-emerald-600/30 transition flex items-center justify-center gap-1.5 whitespace-nowrap">
-          <svg id="svgScanSpin" class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
-          <span id="btnScanNowText">اسکن و ارتقای فوری</span>
-        </button>
-        <input type="text" id="inpCfIpOverride" placeholder="e.g. 104.16.132.229" class="w-full sm:w-44 px-3 py-2.5 rounded-2xl bg-slate-950/80 border border-slate-700 text-cyan-300 font-mono text-xs focus:outline-none focus:border-cyan-500 transition placeholder:text-slate-600">
-        <button onclick="saveCfIpOverride()" class="w-full sm:w-auto px-3.5 py-2.5 rounded-2xl bg-cyan-600 hover:bg-cyan-500 text-white font-bold text-xs shadow-lg shadow-cyan-600/30 transition flex items-center justify-center gap-1 whitespace-nowrap">
-          <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>
-          <span id="btnSaveCfIpText">ثبت دستی</span>
-        </button>
-        <button onclick="resetCfIpOverride()" class="w-full sm:w-auto px-3 py-2.5 rounded-2xl bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white font-medium text-xs border border-slate-700 transition flex items-center justify-center gap-1 whitespace-nowrap">
-          <span id="btnResetCfIpText">بازنشانی</span>
-        </button>
-      </div>
-    </div>
-
-    <!-- ONE-CLICK BYPASS MANAGER: Detected Blocked / Failing / Leaked Domains -->
-    <div class="glass-card rounded-3xl border border-slate-800 shadow-2xl overflow-hidden">
-      <div class="p-6 border-b border-slate-800 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
-        <div>
-          <div class="flex items-center gap-2">
-            <h3 id="txtFailingTitle" class="text-lg font-bold text-white">شناسایی دامنه‌های دچار اختلال یا نشتی به ایرلند</h3>
-            <span id="badgeFailingCount" class="px-2 py-0.5 text-[11px] rounded-full bg-rose-500/10 text-rose-400 border border-rose-500/20 font-mono">0 دامنه</span>
-          </div>
-          <p id="txtFailingSub" class="text-xs text-slate-400 mt-0.5">دامنه‌های ایرانی که اشتباهاً از فیلترشکن رد شده‌اند یا ارتباط با آن‌ها با خطا روبرو شده است. با یک کلیک آن‌ها را به مسیر مستقیم ایران اضافه کنید.</p>
+      <!-- Tab 3: Direct Iran Domains -->
+      <div id="panelDom" class="hidden glass-card rounded-3xl p-6 space-y-4">
+        <div class="flex items-center justify-between">
+          <h3 class="font-bold text-sm text-white" id="domTitle">دامنه‌های مستقیم ایران (Bypass Split-Tunnel)</h3>
+          <button onclick="saveDirectDomains()" class="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold">ذخیره و اعمال</button>
         </div>
-        <button onclick="fetchFailingDomains()" class="px-3.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200 border border-slate-700 transition flex items-center gap-1.5 shrink-0">
-          <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
-          <span id="txtBtnRefreshFailing">بروزرسانی زنده</span>
-        </button>
+        <p class="text-xs text-slate-400" id="domDesc">هر دامنه را در یک خط وارد کنید. این دامنه‌ها مستقیماً و بدون مصرف حجم باز می‌شوند.</p>
+        <textarea id="directDomainsTextarea" rows="6" class="w-full p-3 rounded-xl bg-slate-950 border border-white/[0.08] text-xs font-mono text-indigo-200 focus:outline-none ltr-only"></textarea>
       </div>
 
-      <div class="overflow-x-auto">
-        <table class="w-full text-start text-xs">
-          <thead class="bg-slate-900/80 text-slate-400 uppercase font-semibold text-[11px] border-b border-slate-800">
-            <tr>
-              <th id="thFailDomain" class="p-4 text-start">دامنه مقصد (Domain)</th>
-              <th id="thFailHits" class="p-4 text-center">تعداد مراجعه (Hits)</th>
-              <th id="thFailUsers" class="p-4 text-start">کاربران مراجعه‌کننده</th>
-              <th id="thFailReason" class="p-4 text-start">علت شناسایی</th>
-              <th id="thFailAction" class="p-4 text-center">عملیات</th>
-            </tr>
-          </thead>
-          <tbody id="failingDomainsBody" class="divide-y divide-slate-800/60 font-medium">
-            <tr>
-              <td colspan="5" class="p-8 text-center text-slate-500">در حال بارگذاری لیست دامنه‌های دچار اختلال...</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-    </div>
-
-    <!-- User Management Table -->
-    <div class="glass-card rounded-3xl border border-slate-800 shadow-2xl overflow-hidden">
-      <div class="p-6 border-b border-slate-800 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
-        <div>
-          <h3 id="txtUsersTitle" class="text-lg font-bold text-white">مدیریت اعضای خانواده و اشتراک‌ها</h3>
-          <p id="txtUsersSub" class="text-xs text-slate-400 mt-0.5">مشاهده حجم، وضعیت آنلاین، کپی لینک اشتراک و مدیریت ترافیک</p>
+      <!-- Tab 4: Backup & Restore -->
+      <div id="panelBkp" class="hidden glass-card rounded-3xl p-6 space-y-4">
+        <h3 class="font-bold text-sm text-white" id="bkpTitle">پشتیبان‌گیری و بازیابی اطلاعات</h3>
+        <p class="text-xs text-slate-400">دانلود یک نسخه کامل از کاربران، کلیدها و تنظیمات یا بازیابی آن روی سرور دیگر.</p>
+        <div class="flex items-center gap-3 pt-2">
+          <a href="/api/admin/backup" class="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs transition">
+            دانلود فایل پشتیبان (.json)
+          </a>
         </div>
-        <button onclick="openAddMemberModal()" class="px-4 py-2.5 rounded-2xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs shadow-lg shadow-indigo-600/30 transition flex items-center gap-2 shrink-0">
-          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M18 9v3m0 0v3m0-3h3m-3 0h-3m-2-5a4 4 0 11-8 0 4 4 0 018 0zM3 20a6 6 0 0112 0v1H3v-1z"/></svg>
-          <span id="txtBtnAddMember">+ تعریف عضو جدید</span>
-        </button>
       </div>
 
-      <div class="overflow-x-auto">
-        <table class="w-full text-start text-xs">
-          <thead class="bg-slate-900/80 text-slate-400 uppercase font-semibold text-[11px] border-b border-slate-800">
-            <tr>
-              <th id="thUserName" class="p-4 text-start">نام و حساب</th>
-              <th id="thUserStatus" class="p-4 text-center">وضعیت زنده</th>
-              <th id="thUserUsage" class="p-4 text-start">حجم مصرفی / سقف</th>
-              <th id="thUserExpiry" class="p-4 text-start">تاریخ انقضا</th>
-              <th id="thUserActions" class="p-4 text-center">عملیات</th>
-            </tr>
-          </thead>
-          <tbody id="clientsTableBody" class="divide-y divide-slate-800/60 font-medium">
-            <tr>
-              <td colspan="5" class="p-8 text-center text-slate-500">در حال بارگذاری لیست کاربران...</td>
-            </tr>
-          </tbody>
-        </table>
+      <!-- Tab 5: Live Diagnostics -->
+      <div id="panelDiag" class="hidden glass-card rounded-3xl p-6 space-y-4">
+        <div class="flex items-center justify-between">
+          <h3 class="font-bold text-sm text-white">لاگ‌های زنده هسته Xray و سیستم</h3>
+          <button onclick="fetchDiagnostics()" class="px-3 py-1.5 rounded-lg bg-white/[0.05] hover:bg-white/[0.1] text-slate-300 text-xs font-semibold">بروزرسانی لاگ‌ها</button>
+        </div>
+        <pre id="diagOutput" class="p-4 rounded-xl bg-slate-950 border border-white/[0.08] text-[11px] font-mono text-slate-300 max-h-80 overflow-y-auto ltr-only">در حال دریافت لاگ‌ها...</pre>
       </div>
+
     </div>
 
   </main>
 
   <!-- Modals Container -->
 
-  <!-- 1. Add Member Modal -->
+  <!-- Add Member Modal -->
   <div id="addMemberModal" class="hidden fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
-    <div class="bg-slate-900 border border-slate-800 rounded-3xl p-6 sm:p-8 max-w-md w-full space-y-5">
+    <div class="glass-card rounded-3xl p-6 sm:p-8 max-w-md w-full space-y-4">
       <div class="flex items-center justify-between">
-        <h4 id="txtAddModalTitle" class="font-bold text-base text-white">افزودن عضو جدید خانواده</h4>
+        <h4 id="txtAddModalTitle" class="font-bold text-sm sm:text-base text-white">افزودن عضو جدید خانواده</h4>
         <button onclick="closeModal('addMemberModal')" class="text-slate-400 hover:text-white">✕</button>
       </div>
       <form onsubmit="handleAddMember(event)" class="space-y-4">
         <div>
-          <label id="lblAddName" class="block text-xs font-semibold text-slate-300 mb-1">نام یا ایمیل</label>
-          <input type="text" id="addName" required placeholder="مثال: Javad" class="w-full px-4 py-2.5 rounded-xl bg-slate-950 border border-slate-700 text-sm text-white focus:outline-none focus:border-indigo-500">
+          <label class="block text-xs font-semibold text-slate-300 mb-1" id="lblAddName">نام یا ایمیل</label>
+          <input type="text" id="addName" required placeholder="مثال: Sarah" class="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-white/[0.08] text-xs text-white focus:outline-none focus:border-indigo-500">
         </div>
         <div>
-          <label id="lblAddQuota" class="block text-xs font-semibold text-slate-300 mb-1">سقف حجم مجاز (گیگابایت - ۰ برای نامحدود)</label>
-          <input type="number" id="addLimitGb" step="1" value="0" class="w-full px-4 py-2.5 rounded-xl bg-slate-950 border border-slate-700 text-sm text-white focus:outline-none focus:border-indigo-500">
+          <label class="block text-xs font-semibold text-slate-300 mb-1" id="lblAddSpeed">سقف سرعت پیش‌فرض</label>
+          <select id="addSpeedLimit" class="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-white/[0.08] text-xs text-indigo-300 focus:outline-none focus:border-indigo-500">
+            <option value="10">10 Mbps (پیشنهادی)</option>
+            <option value="5">5 Mbps</option>
+            <option value="20">20 Mbps</option>
+            <option value="25">25 Mbps</option>
+            <option value="50">50 Mbps</option>
+            <option value="0">Unlimited (نامحدود)</option>
+          </select>
         </div>
-        <div>
-          <label id="lblAddExpiry" class="block text-xs font-semibold text-slate-300 mb-1">مدت اعتبار (روز - ۰ برای دائمی)</label>
-          <input type="number" id="addExpiryDays" step="1" value="0" class="w-full px-4 py-2.5 rounded-xl bg-slate-950 border border-slate-700 text-sm text-white focus:outline-none focus:border-indigo-500">
-        </div>
-        <button type="submit" id="btnAddSubmit" class="w-full py-3 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-sm shadow-lg shadow-indigo-600/30 transition">
+        <button type="submit" class="w-full py-3 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs shadow-lg shadow-indigo-600/30 transition">
           ایجاد حساب و صدور لینک
         </button>
       </form>
     </div>
   </div>
 
-  <!-- 2. QR & Setup Modal -->
+  <!-- QR & Setup Modal -->
   <div id="qrModal" class="hidden fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
-    <div class="bg-slate-900 border border-slate-800 rounded-3xl p-6 sm:p-8 max-w-lg w-full space-y-4 text-center">
+    <div class="glass-card rounded-3xl p-6 sm:p-8 max-w-md w-full space-y-4 text-center">
       <div class="flex items-center justify-between">
-        <h4 id="qrModalTitle" class="font-bold text-base text-white">اشتراک کاربر</h4>
+        <h4 id="qrModalTitle" class="font-bold text-sm sm:text-base text-white">اشتراک کاربر</h4>
         <button onclick="closeModal('qrModal')" class="text-slate-400 hover:text-white">✕</button>
       </div>
-      <div class="p-3 bg-white rounded-2xl inline-block border-4 border-indigo-600/30">
-        <img id="qrModalImg" src="" alt="QR" class="w-56 h-56 object-contain">
+      <div class="p-3 bg-white rounded-2xl inline-block shadow-md">
+        <img id="qrModalImg" src="" alt="QR" class="w-52 h-52 object-contain">
       </div>
       <div class="space-y-2">
-        <input type="text" id="qrModalUrl" readonly class="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-700 text-xs font-mono text-indigo-300 select-all ltr-only">
-        <div class="flex gap-2">
-          <button id="btnModalCopySub" onclick="copyModalUrl()" class="flex-1 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs transition">کپی لینک اشتراک</button>
-          <button id="btnModalCopyGuide" onclick="copyModalFarsiGuide()" class="flex-1 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-white font-semibold text-xs border border-slate-700 transition">کپی متن راهنما</button>
-        </div>
+        <input type="text" id="qrModalUrl" readonly class="w-full px-3 py-2 rounded-xl bg-slate-950 border border-white/[0.08] text-[11px] font-mono text-indigo-300 select-all text-center ltr-only">
+        <button onclick="copyModalUrl()" class="w-full py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs transition">کپی لینک اشتراک</button>
       </div>
     </div>
   </div>
 
-  <!-- 3. Direct Domains Modal -->
-  <div id="domainsModal" class="hidden fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
-    <div class="bg-slate-900 border border-slate-800 rounded-3xl p-6 sm:p-8 max-w-lg w-full space-y-4">
-      <div class="flex items-center justify-between">
-        <h4 id="txtDomainsModalTitle" class="font-bold text-base text-white">ویرایش دامنه‌های مستقیم ایران (Direct Bypass)</h4>
-        <button onclick="closeModal('domainsModal')" class="text-slate-400 hover:text-white">✕</button>
-      </div>
-      <p id="txtDomainsModalDesc" class="text-xs text-slate-400 leading-relaxed">هر دامنه را در یک خط وارد کنید. این دامنه‌ها مستقیماً و بدون مصرف حجم فیلترشکن باز می‌شوند.</p>
-      <textarea id="domainsTextarea" rows="10" class="w-full p-3 rounded-2xl bg-slate-950 border border-slate-700 text-xs font-mono text-emerald-400 focus:outline-none focus:border-indigo-500 ltr-only"></textarea>
-      <div class="flex justify-end gap-2">
-        <button id="btnDomainsCancel" onclick="closeModal('domainsModal')" class="px-4 py-2 rounded-xl bg-slate-800 text-slate-300 text-xs font-semibold">انصراف</button>
-        <button id="btnDomainsSave" onclick="saveDirectDomains()" class="px-5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold shadow-lg shadow-emerald-600/30">ذخیره و اعمال فوری</button>
-      </div>
-    </div>
+  <!-- Toast Notification -->
+  <div id="toast" class="fixed bottom-6 left-1/2 -translate-x-1/2 px-4 py-2 rounded-xl bg-emerald-600 text-white text-xs font-semibold shadow-xl opacity-0 transition-opacity duration-300 pointer-events-none z-50">
+    ذخیره شد!
   </div>
 
-  <!-- 4. Telegram Alerts Modal -->
-  <div id="telegramModal" class="hidden fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
-    <div class="bg-slate-900 border border-slate-800 rounded-3xl p-6 sm:p-8 max-w-md w-full space-y-4">
-      <div class="flex items-center justify-between">
-        <h4 id="txtTgModalTitle" class="font-bold text-base text-white">تنظیمات ربات تلگرام</h4>
-        <button onclick="closeModal('telegramModal')" class="text-slate-400 hover:text-white">✕</button>
-      </div>
-      <form onsubmit="handleSaveTelegram(event)" class="space-y-4">
-        <div class="flex items-center gap-2">
-          <input type="checkbox" id="tgEnabled" class="w-4 h-4 accent-indigo-600 rounded">
-          <label for="tgEnabled" id="lblTgEnabled" class="text-xs font-semibold text-white">فعال‌سازی هشدارهای تلگرام (تغییر تونل و مصرف حجم)</label>
-        </div>
-        <div>
-          <label id="lblTgToken" class="block text-xs font-semibold text-slate-300 mb-1">Telegram Bot Token</label>
-          <input type="text" id="tgBotToken" placeholder="123456789:ABCdef..." class="w-full px-4 py-2.5 rounded-xl bg-slate-950 border border-slate-700 text-xs font-mono text-white focus:outline-none focus:border-indigo-500 ltr-only">
-        </div>
-        <div>
-          <label id="lblTgChatId" class="block text-xs font-semibold text-slate-300 mb-1">Your Telegram Chat ID</label>
-          <input type="text" id="tgChatId" placeholder="123456789" class="w-full px-4 py-2.5 rounded-xl bg-slate-950 border border-slate-700 text-xs font-mono text-white focus:outline-none focus:border-indigo-500 ltr-only">
-        </div>
-        <div class="flex gap-2">
-          <button type="button" id="btnTgTest" onclick="testTelegramAlert()" class="flex-1 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-cyan-300 font-semibold text-xs border border-slate-700">تست ارسال پیام</button>
-          <button type="submit" id="btnTgSave" class="flex-1 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs shadow-lg shadow-indigo-600/30">ذخیره تنظیمات</button>
-        </div>
-      </form>
+  <footer class="border-t border-white/[0.08] py-4 text-center text-xs text-slate-500">
+    <div class="max-w-6xl mx-auto px-4 flex items-center justify-between">
+      <span>Family Home VPN • Admin Center</span>
+      <span class="text-[11px] font-mono text-emerald-400/80">Self-Healing Watchdog Active</span>
     </div>
-  </div>
-
-  <!-- 5. Diagnostics Modal -->
-  <div id="diagModal" class="hidden fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
-    <div class="bg-slate-900 border border-slate-800 rounded-3xl p-6 sm:p-8 max-w-4xl w-full space-y-4 max-h-[90vh] flex flex-col">
-      <div class="flex items-center justify-between">
-        <h4 id="txtDiagModalTitle" class="font-bold text-base text-white">عیب‌یابی ترافیک و لاگ‌های زنده Xray</h4>
-        <button onclick="closeModal('diagModal')" class="text-slate-400 hover:text-white">✕</button>
-      </div>
-      <div class="flex justify-between items-center gap-4">
-        <button id="btnDiagCopy" onclick="copyRedactedReport()" class="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold">کپی گزارش عیب‌یابی (Sanitized)</button>
-        <button id="btnDiagRefresh" onclick="loadDiagLogs()" class="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-300">بروزرسانی لاگ‌ها</button>
-      </div>
-      <div id="diagLogBox" class="flex-1 overflow-y-auto bg-slate-950 p-4 rounded-2xl border border-slate-800 text-[11px] font-mono text-slate-300 space-y-1 ltr-only max-h-96">
-        در حال بارگذاری...
-      </div>
-    </div>
-  </div>
-
-  <!-- 6. Backup & Restore Modal -->
-  <div id="backupModal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm">
-    <div class="glass-card max-w-lg w-full p-6 rounded-3xl border border-slate-700 shadow-2xl space-y-5">
-      <div class="flex items-center justify-between border-b border-slate-800 pb-3">
-        <h3 id="txtBackupModalTitle" class="font-bold text-base text-white flex items-center gap-2">
-          <svg class="w-5 h-5 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4"/></svg>
-          <span>پشتیبان‌گیری و بازیابی تنظیمات</span>
-        </h3>
-        <button onclick="closeModal('backupModal')" class="text-slate-400 hover:text-white text-lg">✕</button>
-      </div>
-
-      <div class="space-y-4">
-        <!-- Export Section -->
-        <div class="p-4 rounded-2xl bg-slate-900/80 border border-slate-800 space-y-2">
-          <h4 id="lblBackupExportTitle" class="text-xs font-bold text-slate-200">دریافت نسخه پشتیبان (Export)</h4>
-          <p id="lblBackupExportDesc" class="text-xs text-slate-400">یک فایل JSON شامل تمام اعضای خانواده، تنظیمات ترافیک، کد دعوت، و دامنه‌های مستقیم دانلود کنید.</p>
-          <button onclick="downloadBackupFile()" class="w-full py-2.5 rounded-xl bg-purple-600 hover:bg-purple-500 text-white font-bold text-xs transition flex items-center justify-center gap-2 shadow-lg shadow-purple-600/30">
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
-            <span id="btnDownloadBackupText">دانلود فایل پشتیبان (.json)</span>
-          </button>
-        </div>
-
-        <!-- Restore Section -->
-        <div class="p-4 rounded-2xl bg-slate-900/80 border border-slate-800 space-y-2">
-          <h4 id="lblBackupRestoreTitle" class="text-xs font-bold text-slate-200">بازیابی تنظیمات (Restore)</h4>
-          <p id="lblBackupRestoreDesc" class="text-xs text-slate-400">فایل پشتیبان JSON را انتخاب کرده یا متن آن را در کادر زیر قرار دهید:</p>
-          <input type="file" id="backupFileInput" accept=".json" class="hidden" onchange="handleBackupFileSelect(event)">
-          <div class="flex gap-2">
-            <button type="button" onclick="document.getElementById('backupFileInput').click()" class="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-semibold text-slate-200 transition">
-              <span id="btnSelectFileText">انتخاب فایل...</span>
-            </button>
-            <span id="selectedFileName" class="text-xs text-slate-400 self-center truncate"></span>
-          </div>
-          <textarea id="restoreJsonTextarea" rows="3" placeholder="{ ... }" class="w-full p-2.5 rounded-xl bg-slate-950 border border-slate-800 text-xs font-mono text-slate-200 focus:outline-none focus:border-purple-500 ltr-only"></textarea>
-          <button type="button" onclick="executeRestore()" id="btnExecuteRestore" class="w-full py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs transition flex items-center justify-center gap-2 shadow-lg shadow-indigo-600/30">
-            <span id="btnRestoreText">اعمال و بازیابی داده‌ها</span>
-          </button>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- 7. Portal QR Modal -->
-  <div id="portalQrModal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm">
-    <div class="glass-card max-w-sm w-full p-6 rounded-3xl border border-slate-700 shadow-2xl text-center space-y-4">
-      <div class="flex items-center justify-between border-b border-slate-800 pb-2">
-        <h3 id="txtPortalQrTitle" class="font-bold text-sm text-white">بارکد QR پورتال و ثبت‌نام</h3>
-        <button onclick="closeModal('portalQrModal')" class="text-slate-400 hover:text-white text-lg">✕</button>
-      </div>
-
-      <!-- Tab for Public vs LAN -->
-      <div class="flex rounded-xl bg-slate-900 p-1 text-xs">
-        <button onclick="switchPortalQr('public')" id="btnQrTabPublic" class="flex-1 py-1.5 rounded-lg bg-indigo-600 text-white font-bold transition">آدرس عمومی (اینترنت)</button>
-        <button onclick="switchPortalQr('lan')" id="btnQrTabLan" class="flex-1 py-1.5 rounded-lg text-slate-400 font-bold transition">وای‌فای خانه (LAN)</button>
-      </div>
-
-      <div class="bg-white p-3 rounded-2xl inline-block shadow-lg mx-auto">
-        <img id="portalQrImg" src="" alt="Portal QR" class="w-48 h-48 block">
-      </div>
-
-      <div class="space-y-1">
-        <div id="portalQrUrl" class="font-mono text-[11px] text-indigo-300 truncate bg-slate-900/90 px-3 py-1.5 rounded-xl border border-slate-800 ltr-only"></div>
-        <p id="portalQrDesc" class="text-[11px] text-slate-400">با دوربین موبایل اسکن کنید تا مستقیماً به صفحه ثبت‌نام متصل شوید.</p>
-      </div>
-    </div>
-  </div>
+  </footer>
 
   <script>
-    const i18nAdmin = {{
-      fa: {{
-        docTitle: 'مرکز مدیریت فیلترشکن خانواده | Admin Control Center',
-        adminTitle: 'مرکز مدیریت فیلترشکن خانواده',
-        adminSub: 'دید پرنده، مدیریت کاربران، و بای‌پس تک‌کلیک دامنه‌ها',
-        adminRole: 'مدیر سیستم (Tohid)',
-        btnDomains: 'دامنه‌های مستقیم',
-        btnTelegram: 'هشدار تلگرام',
-        btnDiag: 'عیب‌یابی',
-        btnHelp: 'راهنما',
-        btnBackup: 'پشتیبان‌گیری',
-        langSwitch: 'English',
-        logout: 'خروج',
-
-        // Connection Banner
-        connStatusTitle: 'وضعیت دسترسی و اشتراک‌گذاری سراسری',
-        connStatusSub: 'آدرس‌های پورتال برای دسترسی محلی در خانه و اشتراک‌گذاری امن از راه دور',
-        btnShareWhatsApp: 'اشتراک با واتس‌اپ',
-        btnShareTelegram: 'اشتراک با تلگرام',
-        btnPortalQr: 'بارکد QR',
-        lblLocalHostTitle: 'آدرس محلی روی این لپ‌تاپ:',
-        subLocalHost: 'مخصوص مرورگر همین دستگاه',
-        lblLanTitle: 'آدرس وای‌فای خانگی (LAN):',
-        subLanTitle: 'برای دستگاه‌های متصل به همین وای‌فای',
-        lblPublicTunnelTitle: 'آدرس عمومی اینترنت (تونل ابری):',
-        subPublicTunnel: 'قابل دسترسی از سراسر دنیا و ایران',
-
-        // Backup Modal
-        backupModalTitle: 'پشتیبان‌گیری و بازیابی تنظیمات',
-        lblBackupExportTitle: 'دریافت نسخه پشتیبان (Export)',
-        lblBackupExportDesc: 'یک فایل JSON شامل تمام اعضای خانواده، تنظیمات ترافیک، کد دعوت، و دامنه‌های مستقیم دانلود کنید.',
-        btnDownloadBackupText: 'دانلود فایل پشتیبان (.json)',
-        lblBackupRestoreTitle: 'بازیابی تنظیمات (Restore)',
-        lblBackupRestoreDesc: 'فایل پشتیبان JSON را انتخاب کرده یا متن آن را در کادر زیر قرار دهید:',
-        btnSelectFileText: 'انتخاب فایل...',
-        btnRestoreText: 'اعمال و بازیابی داده‌ها',
-
-        // Portal QR Modal
-        portalQrTitle: 'بارکد QR پورتال و ثبت‌نام',
-        portalQrTabPublic: 'آدرس عمومی (اینترنت)',
-        portalQrTabLan: 'وای‌فای خانه (LAN)',
-        portalQrDesc: 'با دوربین موبایل اسکن کنید تا مستقیماً به صفحه ثبت‌نام متصل شوید.',
-
-        // KPI
-        kpiTotalUsers: 'کل کاربران خانواده',
-        kpiSubTotalUsers: 'حساب‌های فعال در سرور',
-        kpiOnline: 'کاربران آنلاین در این لحظه',
-        kpiSubOnline: 'ترافیک زنده ۱۵ دقیقه اخیر',
-        kpiBandwidth: 'مجموع ترافیک خانواده',
-        kpiWatchdog: 'سیستم خودترمیمی و تونل',
-        kpiSubWatchdog: 'Cloudflare Quick Tunnel',
-
-        // Invite Card
-        inviteBadge: 'کد دعوت فعال خانواده',
-        inviteTitle: 'کد دعوت:',
-        btnEditInvite: 'ویرایش',
-        inviteDesc: 'این لینک و کد را برای اعضای خانواده بفرستید تا بتوانند مستقیماً از گوشی ثبت‌نام کرده و اشتراک هوشمند دریافت کنند.',
-        btnCopyInvite: 'کپی لینک دعوت و متن آماده',
-
-        // Automated Clean Edge IP Optimizer
-        cfIpBadge: 'بهینه‌سازی خودکار سرعت و Clean Edge IP',
-        cfIpTitle: 'آی‌پی کلودفلر فعال (پروفایل ۱):',
-        cfIpDesc: 'اسکنر هوشمند هر ۱۵ دقیقه پینگ و پایداری ۲۴ آی‌پی Anycast کلودفلر را بررسی کرده و سریع‌ترین آی‌پی را به عنوان پروفایل شماره ۱ به اشتراک‌های خانواده ارتقا می‌دهد.',
-        lblAutoOptimizeText: 'بهینه‌سازی خودکار (هر ۱۵ دقیقه)',
-        lblLastScanText: 'آخرین اسکن:',
-        btnScanNowText: 'اسکن و ارتقای فوری',
-        btnSaveCfIpText: 'ثبت دستی',
-        btnResetCfIpText: 'بازنشانی به خودکار',
-
-        // Failing Domains
-        failingTitle: 'شناسایی دامنه‌های دچار اختلال یا نشتی به ایرلند',
-        failingSub: 'دامنه‌های ایرانی که اشتباهاً از فیلترشکن رد شده‌اند یا ارتباط با آن‌ها با خطا روبرو شده است. با یک کلیک آن‌ها را به مسیر مستقیم ایران اضافه کنید.',
-        btnRefreshFailing: 'بروزرسانی زنده',
-        thFailDomain: 'دامنه مقصد (Domain)',
-        thFailHits: 'تعداد مراجعه (Hits)',
-        thFailUsers: 'کاربران مراجعه‌کننده',
-        thFailReason: 'علت شناسایی',
-        thFailAction: 'عملیات',
-        emptyFailing: 'هیچ دامنه مسدود یا نشت‌کرده‌ای ثبت نشده است. سیستم کاملاً سالم است!',
-        btnBypassText: '+ افزودن به لیست مستقیم ایران',
-        btnBypassedText: '✓ در لیست مستقیم',
-
-        // User Management
-        usersTitle: 'مدیریت اعضای خانواده و اشتراک‌ها',
-        usersSub: 'مشاهده حجم، وضعیت آنلاین، کپی لینک اشتراک و مدیریت ترافیک',
-        btnAddMember: '+ تعریف عضو جدید',
-        thUserName: 'نام و حساب',
-        thUserStatus: 'وضعیت زنده',
-        thUserUsage: 'حجم مصرفی / سقف',
-        thUserExpiry: 'تاریخ انقضا',
-        thUserActions: 'عملیات',
-        emptyUsers: 'هیچ کاربری یافت نشد. دکمه تعریف عضو جدید را بزنید.',
-        badgeOnline: 'آنلاین',
-        badgeOffline: 'آفلاین',
-        btnQr: 'کد QR',
-        btnCopyLink: 'کپی لینک',
-        btnResetTraffic: 'ریست مصرف',
-        btnDelete: 'حذف',
-
-        // Modals
-        addModalTitle: 'افزودن عضو جدید خانواده',
-        lblAddName: 'نام یا ایمیل',
-        phAddName: 'مثال: Javad',
-        lblAddQuota: 'سقف حجم مجاز (گیگابایت - ۰ برای نامحدود)',
-        lblAddExpiry: 'مدت اعتبار (روز - ۰ برای دائمی)',
-        btnAddSubmit: 'ایجاد حساب و صدور لینک',
-
-        qrModalTitle: 'اشتراک اختصاصی کاربر',
-        btnModalCopySub: 'کپی لینک اشتراک',
-        btnModalCopyGuide: 'کپی متن راهنما',
-
-        domainsModalTitle: 'ویرایش دامنه‌های مستقیم ایران (Direct Bypass)',
-        domainsModalDesc: 'هر دامنه را در یک خط وارد کنید. این دامنه‌ها مستقیماً و بدون مصرف حجم فیلترشکن باز می‌شوند.',
-        btnDomainsCancel: 'انصراف',
-        btnDomainsSave: 'ذخیره و اعمال فوری',
-
-        tgModalTitle: 'تنظیمات ربات تلگرام',
-        lblTgEnabled: 'فعال‌سازی هشدارهای تلگرام (تغییر تونل و مصرف حجم)',
-        lblTgToken: 'Telegram Bot Token',
-        lblTgChatId: 'Your Telegram Chat ID',
-        btnTgTest: 'تست ارسال پیام',
-        btnTgSave: 'ذخیره تنظیمات',
-
-        diagModalTitle: 'عیب‌یابی ترافیک و لاگ‌های زنده Xray',
-        btnDiagCopy: 'کپی گزارش عیب‌یابی (Sanitized)',
-        btnDiagRefresh: 'بروزرسانی لاگ‌ها',
-        diagLoading: 'در حال خواندن لاگ‌های زنده Xray...'
-      }},
-      en: {{
-        docTitle: 'Family VPN Admin Center | Home VPN Platform',
-        adminTitle: 'Family VPN Admin Center',
-        adminSub: "Bird's-eye view, family accounts & one-click domain bypass",
-        adminRole: 'System Administrator (Tohid)',
-        btnDomains: 'Direct Domains',
-        btnTelegram: 'Telegram Alerts',
-        btnDiag: 'Diagnostics',
-        btnHelp: 'Help & Guide',
-        btnBackup: 'Backup & Restore',
-        langSwitch: 'فارسی',
-        logout: 'Logout',
-
-        // Connection Banner
-        connStatusTitle: 'Global Access & Sharing Status',
-        connStatusSub: 'Portal URLs for local home network access and secure remote sharing',
-        btnShareWhatsApp: 'Share via WhatsApp',
-        btnShareTelegram: 'Share via Telegram',
-        btnPortalQr: 'QR Code',
-        lblLocalHostTitle: 'Localhost URL (This Device):',
-        subLocalHost: 'For browser on this laptop',
-        lblLanTitle: 'Home Wi-Fi LAN IP:',
-        subLanTitle: 'For devices on your home Wi-Fi',
-        lblPublicTunnelTitle: 'Public Cloudflare Tunnel:',
-        subPublicTunnel: 'Accessible globally and from Iran',
-
-        // Backup Modal
-        backupModalTitle: 'Settings Backup & Restore',
-        lblBackupExportTitle: 'Export Settings Backup',
-        lblBackupExportDesc: 'Download a JSON file containing all family members, settings, invite code, and custom direct domains.',
-        btnDownloadBackupText: 'Download Backup (.json)',
-        lblBackupRestoreTitle: 'Restore Settings Backup',
-        lblBackupRestoreDesc: 'Select a JSON backup file or paste its content below:',
-        btnSelectFileText: 'Select File...',
-        btnRestoreText: 'Execute Restore',
-
-        // Portal QR Modal
-        portalQrTitle: 'Portal Access & Signup QR Code',
-        portalQrTabPublic: 'Public Tunnel URL',
-        portalQrTabLan: 'Home Wi-Fi (LAN)',
-        portalQrDesc: 'Scan with your mobile camera to open the signup page directly.',
-
-        // KPI
-        kpiTotalUsers: 'Total Family Members',
-        kpiSubTotalUsers: 'Active accounts on server',
-        kpiOnline: 'Currently Online Users',
-        kpiSubOnline: 'Active traffic in last 15 mins',
-        kpiBandwidth: 'Total Family Bandwidth',
-        kpiWatchdog: 'Tunnel & Self-Healing Watchdog',
-        kpiSubWatchdog: 'Cloudflare Quick Tunnel',
-
-        // Invite Card
-        inviteBadge: 'Active Family Invite Code',
-        inviteTitle: 'Invite Code:',
-        btnEditInvite: 'Edit',
-        inviteDesc: 'Share this link and invite code with family members so they can register and get a ready-to-use VPN profile with zero setup.',
-        btnCopyInvite: 'Copy Invite Link & Instructions',
-
-        // Automated Clean Edge IP Optimizer
-        cfIpBadge: 'Automated Clean Edge IP & Speed Optimizer',
-        cfIpTitle: 'Active Cloudflare Edge IP (Profile #1):',
-        cfIpDesc: 'Background worker scans 24 Cloudflare Anycast edge IPs every 15 minutes, auto-promoting the lowest-latency edge IP as Profile #1 for family subscriptions.',
-        lblAutoOptimizeText: 'Auto-Optimize (Every 15m)',
-        lblLastScanText: 'Last Scan:',
-        btnScanNowText: 'Scan & Promote Now',
-        btnSaveCfIpText: 'Save Manual',
-        btnResetCfIpText: 'Reset to Auto',
-
-        // Failing Domains
-        failingTitle: 'Detected Blocked, Failing & Leaked Domains',
-        failingSub: 'Iranian services leaking through the European proxy or failing connections. Click to add them to the Iran Direct split-tunneling list instantly.',
-        btnRefreshFailing: 'Refresh List',
-        thFailDomain: 'Destination Domain',
-        thFailHits: 'Hits',
-        thFailUsers: 'Affected Users',
-        thFailReason: 'Detection Reason',
-        thFailAction: 'Action',
-        emptyFailing: 'No failing or leaking domains detected. Everything is routing smoothly!',
-        btnBypassText: '+ Add to Iran Direct List',
-        btnBypassedText: '✓ Added to Direct',
-
-        // User Management
-        usersTitle: 'Family Members & Subscription Management',
-        usersSub: 'Monitor data usage, online status, copy subscription URLs, and manage quotas.',
-        btnAddMember: '+ Add Family Member',
-        thUserName: 'Name & Account',
-        thUserStatus: 'Live Status',
-        thUserUsage: 'Data Used / Quota',
-        thUserExpiry: 'Expiration',
-        thUserActions: 'Actions',
-        emptyUsers: 'No users found. Click Add Family Member to create one.',
-        badgeOnline: 'Online',
-        badgeOffline: 'Offline',
-        btnQr: 'QR Code',
-        btnCopyLink: 'Copy Link',
-        btnResetTraffic: 'Reset Usage',
-        btnDelete: 'Delete',
-
-        // Modals
-        addModalTitle: 'Add New Family Member',
-        lblAddName: 'Name or Username',
-        phAddName: 'e.g. Javad',
-        lblAddQuota: 'Data Limit (GB - 0 for unlimited)',
-        lblAddExpiry: 'Validity Period (Days - 0 for never)',
-        btnAddSubmit: 'Create Account & Provision',
-
-        qrModalTitle: 'User Subscription Profile',
-        btnModalCopySub: 'Copy Subscription Link',
-        btnModalCopyGuide: 'Copy Setup Guide',
-
-        domainsModalTitle: 'Edit Iran Direct Bypass Domains',
-        domainsModalDesc: 'Enter one domain per line. These domains will bypass the proxy and route directly via local Iranian internet.',
-        btnDomainsCancel: 'Cancel',
-        btnDomainsSave: 'Save & Apply Instantly',
-
-        tgModalTitle: 'Telegram Bot Alert Settings',
-        lblTgEnabled: 'Enable Telegram Alerts (Tunnel IP updates & 80% Quota warnings)',
-        lblTgToken: 'Telegram Bot Token',
-        lblTgChatId: 'Your Telegram Chat ID',
-        btnTgTest: 'Send Test Alert',
-        btnTgSave: 'Save Settings',
-
-        diagModalTitle: 'Traffic Diagnostics & Live Xray Logs',
-        btnDiagCopy: 'Copy Redacted Report',
-        btnDiagRefresh: 'Refresh Logs',
-        diagLoading: 'Loading live Xray logs...'
-      }}
-    }};
-
-    let currentLang = 'fa';
     let clientsData = [];
-    let failingDomainsData = [];
-    let currentInviteCode = 'IR-FAMILY';
-    let currentShareableLink = '';
-    let currentModalGuide = '';
+    let overviewData = {};
+    let currentInviteCode = '';
+    let currentLang = localStorage.getItem('vpn_lang') || 'fa';
+    let currentModalUrl = '';
 
-    function setLanguage(lang) {{
-      currentLang = (lang === 'en' || lang === 'fa') ? lang : 'fa';
-      localStorage.setItem('vpn_lang', currentLang);
-      const isRtl = (currentLang === 'fa');
+    const i18nAdmin = {
+      fa: {
+        docTitle: 'مرکز مدیریت فیلترشکن خانواده | Family VPN Admin',
+        headerTitle: 'مرکز مدیریت فیلترشکن خانواده',
+        navDash: 'داشبورد',
+        navDirect: 'مسیر مستقیم',
+        navHelp: 'راهنما',
+        navUserPortal: 'پرتال کاربر',
+        navLogout: 'خروج',
+        langLabel: 'English',
+        heroOnlineTitle: 'کاربران آنلاین',
+        heroOnlineLabel: 'آنلاین',
+        heroUrlTitle: 'آدرس عمومی پرتال',
+        heroInviteTitle: 'کد دعوت خانواده',
+        btnEditInvite: 'ویرایش',
+        btnCopyInvite: 'کپی',
+        btnHeroCopy: 'کپی لینک',
+        tblTitle: 'کاربران و اشتراک‌های خانواده',
+        tblSub: 'کنترل سقف سرعت هر کاربر، مشاهده حجم مصرفی و صدور لینک',
+        btnAddMember: '+ تعریف عضو جدید',
+        thUser: 'کاربر / ایمیل',
+        thStatus: 'وضعیت',
+        thUsage: 'حجم مصرفی',
+        thSpeed: 'سقف سرعت',
+        thActions: 'عملیات',
+        emptyUsers: 'هیچ کاربری یافت نشد. دکمه تعریف عضو جدید را بزنید.',
+        unlimited: 'نامحدود (0)',
+        speedToast: 'سقف سرعت کاربر به روز رسانی شد',
+        copied: 'در کلیپ‌بورد کپی شد!'
+      },
+      en: {
+        docTitle: 'Family VPN Admin Center | Home VPN Platform',
+        headerTitle: 'Family VPN Admin Center',
+        navDash: 'Dashboard',
+        navDirect: 'Direct Routing',
+        navHelp: 'Help',
+        navUserPortal: 'User Portal',
+        navLogout: 'Logout',
+        langLabel: 'فارسی',
+        heroOnlineTitle: 'Active Users Online',
+        heroOnlineLabel: 'Online',
+        heroUrlTitle: 'Live Public Portal',
+        heroInviteTitle: 'Family Invite Code',
+        btnEditInvite: 'Edit',
+        btnCopyInvite: 'Copy',
+        btnHeroCopy: 'Copy Link',
+        tblTitle: 'Family Users & Subscriptions',
+        tblSub: 'Manage user speed limits, track data usage, and export profiles',
+        btnAddMember: '+ Add Family Member',
+        thUser: 'User / Email',
+        thStatus: 'Status',
+        thUsage: 'Data Used',
+        thSpeed: 'Speed Limit',
+        thActions: 'Actions',
+        emptyUsers: 'No users found. Click Add Family Member to create one.',
+        unlimited: 'Unlimited (0)',
+        speedToast: 'User speed limit updated',
+        copied: 'Copied to clipboard!'
+      }
+    };
 
-      document.documentElement.setAttribute('lang', currentLang);
+    function setLanguage(lang) {
+      currentLang = lang;
+      localStorage.setItem('vpn_lang', lang);
+      const isRtl = (lang === 'fa');
+      document.documentElement.setAttribute('lang', lang);
       document.documentElement.setAttribute('dir', isRtl ? 'rtl' : 'ltr');
 
-      const dict = i18nAdmin[currentLang];
-      const docT = document.getElementById('docTitle');
-      if (docT) docT.textContent = dict.docTitle;
-      document.title = dict.docTitle;
+      const t = i18nAdmin[currentLang];
+      document.getElementById('docTitle').textContent = t.docTitle;
+      document.getElementById('txtHeaderTitle').textContent = t.headerTitle;
+      document.getElementById('navDash').textContent = t.navDash;
+      document.getElementById('navDirect').textContent = t.navDirect;
+      document.getElementById('navHelp').textContent = t.navHelp;
+      document.getElementById('navUserPortal').textContent = t.navUserPortal;
+      document.getElementById('navLogout').textContent = t.navLogout;
+      document.getElementById('langSwitchLabel').textContent = t.langLabel;
+      document.getElementById('heroOnlineTitle').textContent = t.heroOnlineTitle;
+      document.getElementById('heroOnlineLabel').textContent = t.heroOnlineLabel;
+      document.getElementById('heroUrlTitle').textContent = t.heroUrlTitle;
+      document.getElementById('heroInviteTitle').textContent = t.heroInviteTitle;
+      document.getElementById('btnEditInvite').textContent = t.btnEditInvite;
+      document.getElementById('btnCopyInvite').textContent = t.btnCopyInvite;
+      document.getElementById('btnHeroCopy').textContent = t.btnHeroCopy;
+      document.getElementById('tblTitle').textContent = t.tblTitle;
+      document.getElementById('tblSub').textContent = t.tblSub;
+      document.getElementById('btnAddMember').textContent = t.btnAddMember;
+      document.getElementById('thUser').textContent = t.thUser;
+      document.getElementById('thStatus').textContent = t.thStatus;
+      document.getElementById('thUsage').textContent = t.thUsage;
+      document.getElementById('thSpeed').textContent = t.thSpeed;
+      document.getElementById('thActions').textContent = t.thActions;
 
-      const setTxt = (id, val) => {{
-        const el = document.getElementById(id);
-        if (el) el.textContent = val;
-      }};
+      renderClientsTable(clientsData);
+    }
 
-      setTxt('txtAdminTitle', dict.adminTitle);
-      setTxt('txtAdminSub', dict.adminSub);
-      setTxt('txtAdminRoleBadge', dict.adminRole);
-      setTxt('txtBtnDomains', dict.btnDomains);
-      setTxt('txtBtnTelegram', dict.btnTelegram);
-      setTxt('txtBtnDiag', dict.btnDiag);
-      setTxt('langSwitchLabel', dict.langSwitch);
-      setTxt('txtAdminLogout', dict.logout);
+    function toggleLang() {
+      setLanguage(currentLang === 'fa' ? 'en' : 'fa');
+    }
 
-      setTxt('kpiLblTotalUsers', dict.kpiTotalUsers);
-      setTxt('kpiSubTotalUsers', dict.kpiSubTotalUsers);
-      setTxt('kpiLblOnline', dict.kpiOnline);
-      setTxt('kpiSubOnline', dict.kpiSubOnline);
-      setTxt('kpiLblBandwidth', dict.kpiBandwidth);
-      setTxt('kpiLblWatchdog', dict.kpiWatchdog);
-      setTxt('kpiSubWatchdog', dict.kpiSubWatchdog);
+    function showToast(msg) {
+      const toast = document.getElementById('toast');
+      toast.textContent = msg;
+      toast.classList.remove('opacity-0');
+      toast.classList.add('opacity-100');
+      setTimeout(() => {
+        toast.classList.remove('opacity-100');
+        toast.classList.add('opacity-0');
+      }, 2500);
+    }
 
-      setTxt('txtInviteBadge', dict.inviteBadge);
-      setTxt('lblInviteTitle', dict.inviteTitle);
-      setTxt('btnEditInvite', dict.btnEditInvite);
-      setTxt('txtInviteDesc', dict.inviteDesc);
-      setTxt('btnCopyInviteText', dict.btnCopyInvite);
+    function switchAdminTab(tab) {
+      const panels = ['panelCf', 'panelTg', 'panelDom', 'panelBkp', 'panelDiag'];
+      panels.forEach(p => {
+        const el = document.getElementById(p);
+        if (el) el.classList.add('hidden');
+      });
 
-      setTxt('txtFailingTitle', dict.failingTitle);
-      setTxt('txtFailingSub', dict.failingSub);
-      setTxt('txtBtnRefreshFailing', dict.btnRefreshFailing);
-      setTxt('thFailDomain', dict.thFailDomain);
-      setTxt('thFailHits', dict.thFailHits);
-      setTxt('thFailUsers', dict.thFailUsers);
-      setTxt('thFailReason', dict.thFailReason);
-      setTxt('thFailAction', dict.thFailAction);
+      if (tab === 'cf') document.getElementById('panelCf').classList.remove('hidden');
+      if (tab === 'telegram') {
+        document.getElementById('panelTg').classList.remove('hidden');
+        fetchTelegramConfig();
+      }
+      if (tab === 'domains') {
+        document.getElementById('panelDom').classList.remove('hidden');
+        fetchDirectDomains();
+      }
+      if (tab === 'backup') document.getElementById('panelBkp').classList.remove('hidden');
+      if (tab === 'diag') {
+        document.getElementById('panelDiag').classList.remove('hidden');
+        fetchDiagnostics();
+      }
+    }
 
-      setTxt('txtUsersTitle', dict.usersTitle);
-      setTxt('txtUsersSub', dict.usersSub);
-      setTxt('txtBtnAddMember', dict.btnAddMember);
-      setTxt('thUserName', dict.thUserName);
-      setTxt('thUserStatus', dict.thUserStatus);
-      setTxt('thUserUsage', dict.thUserUsage);
-      setTxt('thUserExpiry', dict.thUserExpiry);
-      setTxt('thUserActions', dict.thUserActions);
-
-      setTxt('txtAddModalTitle', dict.addModalTitle);
-      setTxt('lblAddName', dict.lblAddName);
-      const inAddName = document.getElementById('addName');
-      if (inAddName) inAddName.placeholder = dict.phAddName;
-      setTxt('lblAddQuota', dict.lblAddQuota);
-      setTxt('lblAddExpiry', dict.lblAddExpiry);
-      setTxt('btnAddSubmit', dict.btnAddSubmit);
-
-      setTxt('qrModalTitle', dict.qrModalTitle);
-      setTxt('btnModalCopySub', dict.btnModalCopySub);
-      setTxt('btnModalCopyGuide', dict.btnModalCopyGuide);
-
-      setTxt('txtDomainsModalTitle', dict.domainsModalTitle);
-      setTxt('txtDomainsModalDesc', dict.domainsModalDesc);
-      setTxt('btnDomainsCancel', dict.btnDomainsCancel);
-      setTxt('btnDomainsSave', dict.btnDomainsSave);
-
-      setTxt('txtTgModalTitle', dict.tgModalTitle);
-      setTxt('lblTgEnabled', dict.lblTgEnabled);
-      setTxt('lblTgToken', dict.lblTgToken);
-      setTxt('lblTgChatId', dict.lblTgChatId);
-      setTxt('btnTgTest', dict.btnTgTest);
-      setTxt('btnTgSave', dict.btnTgSave);
-
-      setTxt('txtDiagModalTitle', dict.diagModalTitle);
-      setTxt('btnDiagCopy', dict.btnDiagCopy);
-      setTxt('btnDiagRefresh', dict.btnDiagRefresh);
-
-      setTxt('txtCfIpBadge', dict.cfIpBadge);
-      setTxt('lblCfIpTitle', dict.cfIpTitle);
-      setTxt('txtCfIpDesc', dict.cfIpDesc);
-      setTxt('lblAutoOptimizeText', dict.lblAutoOptimizeText);
-      setTxt('lblLastScanText', dict.lblLastScanText);
-      setTxt('btnScanNowText', dict.btnScanNowText);
-      setTxt('btnSaveCfIpText', dict.btnSaveCfIpText);
-      setTxt('btnResetCfIpText', dict.btnResetCfIpText);
-
-      setTxt('txtBtnHelp', dict.btnHelp);
-      setTxt('txtBtnBackup', dict.btnBackup);
-      setTxt('txtConnStatusTitle', dict.connStatusTitle);
-      setTxt('txtConnStatusSub', dict.connStatusSub);
-      setTxt('btnShareWhatsApp', dict.btnShareWhatsApp);
-      setTxt('btnShareTelegram', dict.btnShareTelegram);
-      setTxt('btnPortalQr', dict.btnPortalQr);
-      setTxt('lblLocalHostTitle', dict.lblLocalHostTitle);
-      setTxt('subLocalHost', dict.subLocalHost);
-      setTxt('lblLanTitle', dict.lblLanTitle);
-      setTxt('subLanTitle', dict.subLanTitle);
-      setTxt('lblPublicTunnelTitle', dict.lblPublicTunnelTitle);
-      setTxt('subPublicTunnel', dict.subPublicTunnel);
-
-      setTxt('txtBackupModalTitle', dict.backupModalTitle);
-      setTxt('lblBackupExportTitle', dict.lblBackupExportTitle);
-      setTxt('lblBackupExportDesc', dict.lblBackupExportDesc);
-      setTxt('btnDownloadBackupText', dict.btnDownloadBackupText);
-      setTxt('lblBackupRestoreTitle', dict.lblBackupRestoreTitle);
-      setTxt('lblBackupRestoreDesc', dict.lblBackupRestoreDesc);
-      setTxt('btnSelectFileText', dict.btnSelectFileText);
-      setTxt('btnRestoreText', dict.btnRestoreText);
-
-      setTxt('txtPortalQrTitle', dict.portalQrTitle);
-      setTxt('btnQrTabPublic', dict.portalQrTabPublic);
-      setTxt('btnQrTabLan', dict.portalQrTabLan);
-      setTxt('portalQrDesc', dict.portalQrDesc);
-
-      // Re-render dynamic lists with new language
-      if (clientsData && clientsData.length > 0) {{
-        renderClientsTable(clientsData);
-      }}
-      if (failingDomainsData && failingDomainsData.length > 0) {{
-        renderFailingDomainsTable(failingDomainsData);
-      }}
-    }}
-
-    function toggleLang() {{
-      const nextLang = (currentLang === 'fa') ? 'en' : 'fa';
-      setLanguage(nextLang);
-      try {{
-        const url = new URL(window.location);
-        url.searchParams.set('lang', nextLang);
-        window.history.replaceState({{}}, '', url);
-      }} catch (e) {{}}
-    }}
-
-    function closeModal(id) {{
-      document.getElementById(id).classList.add('hidden');
-    }}
-    function openModal(id) {{
-      document.getElementById(id).classList.remove('hidden');
-    }}
-
-    async function fetchAdminOverview() {{
-      try {{
+    async function fetchOverview() {
+      try {
         const res = await fetch('/api/admin/overview');
-        if (res.status === 401) {{
-          window.location.href = '/?mode=login&need=admin';
-          return;
-        }}
-        const d = await res.json();
-        document.getElementById('kpiValTotalUsers').textContent = d.total_users;
-        document.getElementById('kpiValOnline').textContent = d.online_users;
-        document.getElementById('kpiValBandwidth').textContent = d.total_bandwidth_str;
-        document.getElementById('kpiValUp').textContent = d.total_up_str;
-        document.getElementById('kpiValDown').textContent = d.total_down_str;
-        document.getElementById('kpiValWatchdog').textContent = d.watchdog_status;
+        if (res.status === 401) { window.location.href = '/login'; return; }
+        overviewData = await res.json();
         
-        currentInviteCode = d.invite_code;
-        currentShareableLink = d.shareable_invite_url;
-        currentLocalUrl = d.local_portal_url || ('http://127.0.0.1:' + (d.portal_port || 8080));
-        currentLanUrl = d.lan_portal_url || currentLocalUrl;
-        currentPublicUrl = d.portal_url || '';
+        document.getElementById('heroOnlineCount').textContent = overviewData.online_users || 0;
+        document.getElementById('heroOnlineSub').textContent = (currentLang === 'fa') 
+          ? `مجموع ${overviewData.total_users || 0} کاربر خانواده ثبت‌نام شده` 
+          : `Total ${overviewData.total_users || 0} family members registered`;
 
-        document.getElementById('txtCurrentInviteCode').textContent = d.invite_code;
-        const autoOpt = (d.cf_auto_optimize !== false);
-        const chkAuto = document.getElementById('chkCfAutoOptimize');
-        if (chkAuto) chkAuto.checked = autoOpt;
+        const publicUrl = overviewData.shareable_invite_url || overviewData.portal_url || window.location.origin;
+        document.getElementById('heroPublicUrl').textContent = publicUrl;
 
-        document.getElementById('txtActiveCfIp').textContent = d.cf_active_edge_ip || '104.16.132.229';
+        currentInviteCode = overviewData.invite_code || 'FAMILY2026';
+        document.getElementById('heroInviteCode').textContent = currentInviteCode;
 
-        if (autoOpt) {{
-          document.getElementById('txtCfIpType').textContent = (currentLang === 'fa' ? 'ارتقای خودکار' : 'Auto-Promoted');
-          document.getElementById('txtCfIpType').className = 'text-[10px] text-emerald-300 bg-emerald-950/80 px-2 py-0.5 rounded-lg border border-emerald-700/60 font-semibold';
-          document.getElementById('txtCfLatency').textContent = d.cf_latency_ms ? (d.cf_latency_ms + ' ms') : '-- ms';
-          document.getElementById('txtCfLatency').className = 'text-[10px] text-cyan-300 bg-cyan-950/80 px-2 py-0.5 rounded-lg border border-cyan-700/60 font-mono';
-        }} else if (d.cf_ip_override) {{
-          document.getElementById('txtActiveCfIp').textContent = d.cf_ip_override;
-          document.getElementById('txtCfIpType').textContent = (currentLang === 'fa' ? 'شخصی‌سازی دستی' : 'Manual Override');
-          document.getElementById('txtCfIpType').className = 'text-[10px] text-amber-300 bg-amber-950/80 px-2 py-0.5 rounded-lg border border-amber-700/60 font-semibold';
-          document.getElementById('txtCfLatency').textContent = '-- ms';
-        }} else {{
-          document.getElementById('txtCfIpType').textContent = (currentLang === 'fa' ? 'پیش‌فرض Anycast' : 'Default Anycast');
-          document.getElementById('txtCfIpType').className = 'text-[10px] text-cyan-300 bg-cyan-950/80 px-2 py-0.5 rounded-lg border border-cyan-700/60 font-semibold';
-          document.getElementById('txtCfLatency').textContent = '-- ms';
-        }}
-        document.getElementById('inpCfIpOverride').value = d.cf_ip_override || '';
-        document.getElementById('txtCfLastScan').textContent = d.cf_last_scan_time || 'Never';
-        document.getElementById('valLocalUrl').textContent = currentLocalUrl;
-        document.getElementById('valLanUrl').textContent = currentLanUrl;
-        document.getElementById('valPublicUrl').textContent = currentPublicUrl || (currentLang === 'fa' ? 'در حال برقراری ارتباط...' : 'Connecting...');
-      }} catch (e) {{
-        console.error('Fetch overview error:', e);
-      }}
-    }}
+        if (overviewData.cf_active_edge_ip) {
+          document.getElementById('cfActiveIpDisplay').textContent = `Active: ${overviewData.cf_active_edge_ip} (${overviewData.cf_latency_ms || 0}ms)`;
+        }
+      } catch (e) {
+        console.error('Overview error:', e);
+      }
+    }
 
-    async function fetchClients() {{
-      try {{
+    async function fetchClients() {
+      try {
         const res = await fetch('/api/clients');
-        const d = await res.json();
-        clientsData = d.clients || [];
+        const data = await res.json();
+        clientsData = data.clients || [];
         renderClientsTable(clientsData);
-      }} catch (e) {{
-        console.error('Fetch clients error:', e);
-      }}
-    }}
+      } catch (e) {
+        console.error('Clients error:', e);
+      }
+    }
 
-    function renderClientsTable(list) {{
+    function renderClientsTable(list) {
       const tbody = document.getElementById('clientsTableBody');
       if (!tbody) return;
-      if (!list || list.length === 0) {{
-        tbody.innerHTML = `<tr><td colspan="5" class="p-8 text-center text-slate-500">${{i18nAdmin[currentLang].emptyUsers}}</td></tr>`;
+      if (!list || list.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="5" class="p-8 text-center text-slate-500">${i18nAdmin[currentLang].emptyUsers}</td></tr>`;
         return;
-      }}
+      }
 
-      const badgeOnlineTxt = i18nAdmin[currentLang].badgeOnline;
-      const badgeOfflineTxt = i18nAdmin[currentLang].badgeOffline;
-      const btnQrTxt = i18nAdmin[currentLang].btnQr;
-      const btnCopyTxt = i18nAdmin[currentLang].btnCopyLink;
-      const btnResetTxt = i18nAdmin[currentLang].btnResetTraffic;
-      const btnDelTxt = i18nAdmin[currentLang].btnDelete;
+      tbody.innerHTML = list.map(c => {
+        const isOnline = c.is_online;
+        const onlineDot = isOnline
+          ? `<span class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-[10px] font-bold"><span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>${currentLang === 'fa' ? 'آنلاین' : 'Online'}</span>`
+          : `<span class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-white/[0.04] text-slate-400 border border-white/[0.06] text-[10px]">${currentLang === 'fa' ? 'آفلاین' : 'Offline'}</span>`;
 
-      tbody.innerHTML = list.map(c => {{
-        const onlineBadge = c.is_online
-          ? `<span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-[10px] font-bold"><span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping"></span>${{badgeOnlineTxt}}</span>`
-          : `<span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-slate-800 text-slate-400 border border-slate-700 text-[10px]">${{badgeOfflineTxt}}</span>`;
-
-        const lastSeen = (currentLang === 'fa' ? c.last_seen_fa : c.last_seen_en) || '-';
-        const limitLabel = (c.limit_bytes > 0) ? c.limit_str : (currentLang === 'fa' ? 'نامحدود' : 'Unlimited');
-
+        const bw = (c.bandwidth_limit_mbps !== undefined && c.bandwidth_limit_mbps !== null) ? c.bandwidth_limit_mbps : 10;
+        
         return `
-          <tr class="hover:bg-slate-900/40 transition">
-            <td class="p-4 text-start">
-              <div class="font-bold text-white text-xs">${{c.email}}</div>
-              <div class="text-[10px] text-slate-500 font-mono mt-0.5">${{c.id.substring(0, 8)}}...</div>
+          <tr class="hover:bg-white/[0.02] transition">
+            <td class="p-3.5 text-start">
+              <div class="font-bold text-white text-xs">${c.email}</div>
+              <div class="text-[10px] text-slate-500 font-mono">${(c.id || '').substring(0, 8)}...</div>
             </td>
-            <td class="p-4 text-center">
-              <div>${{onlineBadge}}</div>
-              <div class="text-[10px] text-slate-500 mt-1">${{lastSeen}}</div>
+            <td class="p-3.5 text-center">
+              <div>${onlineDot}</div>
             </td>
-            <td class="p-4 text-start">
-              <div class="font-bold text-slate-200 text-xs">${{c.total_used_str}} / <span class="text-slate-500 font-normal">${{limitLabel}}</span></div>
-              <div class="text-[10px] text-slate-500 font-mono">↑ ${{c.up_str}} | ↓ ${{c.down_str}}</div>
+            <td class="p-3.5 text-start">
+              <div class="font-bold text-slate-200 text-xs">${c.total_used_str || '0 B'}</div>
+              <div class="text-[10px] text-slate-500 font-mono">↑ ${c.up_str || '0 B'} | ↓ ${c.down_str || '0 B'}</div>
             </td>
-            <td class="p-4 text-xs text-slate-400 text-start">${{c.expiry_str}}</td>
-            <td class="p-4 text-center">
-              <div class="inline-flex items-center gap-1.5 flex-wrap justify-center">
-                <button onclick="openClientQr('${{c.id}}')" class="px-2.5 py-1.5 rounded-xl bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/30 text-[11px] font-semibold transition">${{btnQrTxt}}</button>
-                <button onclick="copyClientSub('${{c.smart_sub_link}}')" class="px-2.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 text-[11px] font-semibold transition">${{btnCopyTxt}}</button>
-                <button onclick="resetClientTraffic('${{c.email}}')" class="px-2.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-cyan-300 border border-slate-700 text-[11px] font-semibold transition">${{btnResetTxt}}</button>
-                <button onclick="deleteClient('${{c.id}}', '${{c.email}}')" class="px-2.5 py-1.5 rounded-xl bg-rose-950/40 hover:bg-rose-900/60 text-rose-300 border border-rose-800/80 text-[11px] font-semibold transition">${{btnDelTxt}}</button>
+            <td class="p-3.5 text-center">
+              <select onchange="updateClientBandwidth('${c.email}', this.value)" class="px-2.5 py-1 rounded-lg bg-slate-950 border border-white/[0.1] text-xs font-semibold text-indigo-300 focus:outline-none focus:border-indigo-500 cursor-pointer">
+                <option value="5" ${bw === 5 ? 'selected' : ''}>5 Mbps</option>
+                <option value="10" ${bw === 10 ? 'selected' : ''}>10 Mbps (Default)</option>
+                <option value="20" ${bw === 20 ? 'selected' : ''}>20 Mbps</option>
+                <option value="25" ${bw === 25 ? 'selected' : ''}>25 Mbps</option>
+                <option value="50" ${bw === 50 ? 'selected' : ''}>50 Mbps</option>
+                <option value="0" ${bw === 0 ? 'selected' : ''}>${i18nAdmin[currentLang].unlimited}</option>
+              </select>
+            </td>
+            <td class="p-3.5 text-center">
+              <div class="inline-flex items-center gap-1.5 justify-center">
+                <button onclick="openClientQr('${c.id}')" class="px-2 py-1 rounded-lg bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/30 text-[11px] font-semibold transition">QR</button>
+                <button onclick="copyClientSub('${c.smart_sub_link}')" class="px-2 py-1 rounded-lg bg-white/[0.05] hover:bg-white/[0.1] text-slate-300 border border-white/[0.08] text-[11px] font-semibold transition">Copy</button>
+                <button onclick="resetClientTraffic('${c.email}')" class="px-2 py-1 rounded-lg bg-white/[0.05] hover:bg-white/[0.1] text-cyan-300 border border-white/[0.08] text-[11px] font-semibold transition">Reset</button>
+                <button onclick="deleteClient('${c.id}', '${c.email}')" class="px-2 py-1 rounded-lg bg-rose-950/40 hover:bg-rose-900/60 text-rose-300 border border-rose-800/80 text-[11px] font-semibold transition">Delete</button>
               </div>
             </td>
           </tr>
         `;
-      }}).join('');
-    }}
+      }).join('');
+    }
 
-    async function fetchFailingDomains() {{
-      try {{
-        const res = await fetch('/api/admin/failing-domains');
-        const d = await res.json();
-        failingDomainsData = d.domains || [];
-        renderFailingDomainsTable(failingDomainsData);
-      }} catch (e) {{
-        console.error('Fetch failing domains error:', e);
-      }}
-    }}
-
-    function renderFailingDomainsTable(list) {{
-      const badge = document.getElementById('badgeFailingCount');
-      if (badge) {{
-        badge.textContent = list.length + (currentLang === 'fa' ? ' دامنه' : ' domains');
-      }}
-
-      const tbody = document.getElementById('failingDomainsBody');
-      if (!tbody) return;
-      if (!list || list.length === 0) {{
-        tbody.innerHTML = `<tr><td colspan="5" class="p-8 text-center text-slate-500">${{i18nAdmin[currentLang].emptyFailing}}</td></tr>`;
-        return;
-      }}
-
-      const btnBypass = i18nAdmin[currentLang].btnBypassText;
-      const btnBypassed = i18nAdmin[currentLang].btnBypassedText;
-
-      tbody.innerHTML = list.map((item, idx) => {{
-        const isDirect = item.is_direct;
-        const btnAction = isDirect
-          ? `<span class="inline-flex items-center gap-1 px-3 py-1.5 rounded-xl bg-emerald-950/80 text-emerald-400 border border-emerald-800 text-[11px] font-bold">${{btnBypassed}}</span>`
-          : `<button id="btnBypass_${{idx}}" onclick="addSingleDirectDomain('${{item.domain}}', 'btnBypass_${{idx}}')" class="px-3.5 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-[11px] shadow-sm shadow-indigo-600/30 transition flex items-center gap-1.5">
-              <span>${{btnBypass}}</span>
-            </button>`;
-
-        const translatedReasons = item.reasons.map(r => {{
-          if (r.includes('iran_leak') || r.includes('Iranian') || r.includes('نشتی')) {{
-            return currentLang === 'fa' ? 'نشتی ترافیک ایران به خارج' : 'Iranian Traffic Leaked to Ireland';
-          }}
-          if (r.includes('rejected') || r.includes('رد شده') || r.includes('مسدود')) {{
-            return currentLang === 'fa' ? 'اتصال مسدود یا رد شد' : 'Connection Blocked / Rejected';
-          }}
-          if (r.includes('timeout') || r.includes('تایم‌اوت')) {{
-            return currentLang === 'fa' ? 'خطای تایم‌اوت شبکه' : 'Connection Timeout';
-          }}
-          return r;
-        }}).join(' | ');
-
-        return `
-          <tr class="hover:bg-slate-900/40 transition">
-            <td class="p-4 font-mono font-bold text-white text-xs ltr-only text-start">${{item.domain}}</td>
-            <td class="p-4 text-center font-mono font-bold text-indigo-400 text-xs">${{item.hits}}</td>
-            <td class="p-4 text-slate-300 text-xs text-start">${{item.users.join(', ') || 'Client'}}</td>
-            <td class="p-4 text-rose-300 text-xs font-semibold text-start">${{translatedReasons}}</td>
-            <td class="p-4 text-center">${{btnAction}}</td>
-          </tr>
-        `;
-      }}).join('');
-    }}
-
-    async function addSingleDirectDomain(domain, btnId) {{
-      const btn = document.getElementById(btnId);
-      if (btn) {{
-        btn.disabled = true;
-        btn.textContent = (currentLang === 'fa' ? 'در حال ذخیره...' : 'Saving...');
-      }}
-      try {{
-        const res = await fetch('/api/admin/direct-domains/add', {{
+    async function updateClientBandwidth(email, val) {
+      try {
+        const res = await fetch(`/api/admin/client/${encodeURIComponent(email)}/bandwidth`, {
           method: 'POST',
-          headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ domain: domain }})
-        }});
-        if (res.ok) {{
-          if (btn) {{
-            btn.className = 'inline-flex items-center gap-1 px-3 py-1.5 rounded-xl bg-emerald-950/80 text-emerald-400 border border-emerald-800 text-[11px] font-bold';
-            btn.innerHTML = (currentLang === 'fa' ? '✓ در لیست مستقیم' : '✓ Added to Direct');
-          }}
-          fetchFailingDomains();
-        }} else {{
-          alert(currentLang === 'fa' ? 'خطا در افزودن دامنه' : 'Failed to add domain');
-        }}
-      }} catch (e) {{
-        alert('Error: ' + e);
-      }}
-    }}
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({bandwidth_limit_mbps: parseInt(val)})
+        });
+        if (res.ok) {
+          showToast(`${i18nAdmin[currentLang].speedToast}: ${val == 0 ? 'Unlimited' : val + ' Mbps'}`);
+          fetchClients();
+        }
+      } catch (e) {
+        console.error(e);
+      }
+    }
 
-    function copyShareableInviteLink() {{
-      const text = currentLang === 'fa'
-        ? `🌟 لینک اختصاصی فیلترشکن خانواده:
-${{currentShareableLink}}
+    function toggleEditInvite() {
+      document.getElementById('inviteDisplayWrap').classList.add('hidden');
+      document.getElementById('inviteEditWrap').classList.remove('hidden');
+      document.getElementById('inputNewInvite').value = currentInviteCode;
+      document.getElementById('inputNewInvite').focus();
+    }
 
-کد دعوت: ${{currentInviteCode}}
+    function cancelEditInvite() {
+      document.getElementById('inviteEditWrap').classList.add('hidden');
+      document.getElementById('inviteDisplayWrap').classList.remove('hidden');
+    }
 
-وارد لینک شده و با وارد کردن کد دعوت، فیلترشکن پرسرعت خود را با یک کلیک دریافت کنید!`
-        : `🌟 Family VPN Access Link:
-${{currentShareableLink}}
-
-Invite Code: ${{currentInviteCode}}
-
-Open the link and enter your invite code to get your personal VPN profile!`;
-      navigator.clipboard.writeText(text).then(() => {{
-        alert(currentLang === 'fa' ? 'لینک دعوت اختصاصی همراه با متن راهنما کپی شد! می‌توانید آن را برای اعضای خانواده بفرستید.' : 'Invite link and instructions copied to clipboard!');
-      }});
-    }}
-
-    async function editInviteCode() {{
-      const promptMsg = currentLang === 'fa' ? 'کد دعوت جدید خانواده را وارد کنید:' : 'Enter new Family Invite Code:';
-      const code = prompt(promptMsg, currentInviteCode);
-      if (!code || !code.trim()) return;
-      try {{
-        const res = await fetch('/api/admin/invite-code', {{
+    async function saveNewInvite() {
+      const code = document.getElementById('inputNewInvite').value.trim();
+      if (!code) return;
+      try {
+        const res = await fetch('/api/admin/invite-code', {
           method: 'POST',
-          headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ invite_code: code.trim() }})
-        }});
-        if (res.ok) {{
-          alert(currentLang === 'fa' ? 'کد دعوت خانواده بروزرسانی شد!' : 'Family invite code updated successfully!');
-          fetchAdminOverview();
-        }}
-      }} catch (e) {{
-        alert('Error: ' + e);
-      }}
-    }}
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({code})
+        });
+        if (res.ok) {
+          currentInviteCode = code.toUpperCase();
+          document.getElementById('heroInviteCode').textContent = currentInviteCode;
+          cancelEditInvite();
+          showToast(currentLang === 'fa' ? 'کد دعوت تغییر یافت!' : 'Invite code updated!');
+        }
+      } catch (e) {
+        console.error(e);
+      }
+    }
 
-    async function toggleCfAutoOptimize(enabled) {{
-      try {{
-        const res = await fetch('/api/admin/cf-optimizer', {{
-          method: 'POST',
-          headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ auto_optimize: enabled }})
-        }});
-        if (res.ok) {{
-          fetchAdminOverview();
-        }}
-      }} catch (e) {{
-        alert('Error: ' + e);
-      }}
-    }}
+    function copyInviteCode() {
+      navigator.clipboard.writeText(currentInviteCode).then(() => {
+        showToast(i18nAdmin[currentLang].copied);
+      });
+    }
 
-    async function triggerCfScanNow() {{
-      const btn = document.getElementById('btnScanNow');
-      const svg = document.getElementById('svgScanSpin');
-      if (svg) svg.classList.add('animate-spin');
-      if (btn) btn.disabled = true;
-      try {{
-        const res = await fetch('/api/admin/cf-optimizer/scan', {{ method: 'POST' }});
-        if (res.ok) {{
-          const d = await res.json();
-          fetchAdminOverview();
-          const msg = (currentLang === 'fa' 
-            ? `اسکن با موفقیت انجام شد!\nسریع‌ترین آی‌پی: ${{d.active_ip}} (${{d.latency_ms}} ms)\nاین آی‌پی به عنوان پروفایل ۱ به تمام اشتراک‌ها ارتقا داده شد.`
-            : `Scan complete!\nFastest IP: ${{d.active_ip}} (${{d.latency_ms}} ms)\nAuto-promoted as Profile #1 in all subscriptions.`);
-          alert(msg);
-        }}
-      }} catch (e) {{
-        alert('Scan error: ' + e);
-      }} finally {{
-        if (svg) svg.classList.remove('animate-spin');
-        if (btn) btn.disabled = false;
-      }}
-    }}
+    function copyPublicUrl() {
+      const url = document.getElementById('heroPublicUrl').textContent.trim();
+      navigator.clipboard.writeText(url).then(() => {
+        showToast(i18nAdmin[currentLang].copied);
+      });
+    }
 
-    async function saveCfIpOverride() {{
-      const ip = document.getElementById('inpCfIpOverride').value.trim();
-      if (!ip) {{
-        alert(currentLang === 'fa' ? 'لطفاً یک آی‌پی معتبر وارد کنید.' : 'Please enter a valid IP address.');
-        return;
-      }}
-      try {{
-        const res = await fetch('/api/admin/cf-optimizer', {{
-          method: 'POST',
-          headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ auto_optimize: false, override_ip: ip }})
-        }});
-        if (res.ok) {{
-          alert(currentLang === 'fa' ? `آی‌پی دستی (${{ip}}) با موفقیت به عنوان مسیر اصلی ذخیره شد و در تمام لینک‌های اشتراک اعمال گردید!` : `Cloudflare IP (${{ip}}) saved and pushed to all subscription links!`);
-          fetchAdminOverview();
-        }} else {{
-          const err = await res.json();
-          alert('Error: ' + (err.detail || 'Failed to save'));
-        }}
-      }} catch (e) {{
-        alert('Error: ' + e);
-      }}
-    }}
+    function shareViaWhatsApp() {
+      const url = document.getElementById('heroPublicUrl').textContent.trim();
+      const text = encodeURIComponent(`Family Home VPN:
+${url}
+Invite Code: ${currentInviteCode}`);
+      window.open(`https://api.whatsapp.com/send?text=${text}`, '_blank');
+    }
 
-    async function resetCfIpOverride() {{
-      const confirmMsg = currentLang === 'fa' ? 'آیا مایل به بازگشت به بهینه‌سازی خودکار سریع‌ترین آی‌پی هستید؟' : 'Revert to automated lowest-latency IP optimizer?';
-      if (!confirm(confirmMsg)) return;
-      try {{
-        const res = await fetch('/api/admin/cf-optimizer', {{
-          method: 'POST',
-          headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ auto_optimize: true, override_ip: '' }})
-        }});
-        if (res.ok) {{
-          document.getElementById('inpCfIpOverride').value = '';
-          fetchAdminOverview();
-          alert(currentLang === 'fa' ? 'سیستم با موفقیت به حالت بهینه‌سازی خودکار بازگشت.' : 'Reverted to automated edge IP optimizer.');
-        }}
-      }} catch (e) {{
-        alert('Error: ' + e);
-      }}
-    }}
+    function shareViaTelegram() {
+      const url = document.getElementById('heroPublicUrl').textContent.trim();
+      const text = encodeURIComponent(`Family Home VPN:
+${url}
+Invite Code: ${currentInviteCode}`);
+      window.open(`https://t.me/share/url?url=${encodeURIComponent(url)}&text=${text}`, '_blank');
+    }
 
-    function openAddMemberModal() {{
-      openModal('addMemberModal');
-    }}
+    function openModal(id) {
+      document.getElementById(id).classList.remove('hidden');
+    }
 
-    async function handleAddMember(e) {{
+    function closeModal(id) {
+      document.getElementById(id).classList.add('hidden');
+    }
+
+    function openPortalQrModal() {
+      const url = document.getElementById('heroPublicUrl').textContent.trim();
+      document.getElementById('qrModalTitle').textContent = (currentLang === 'fa' ? 'بارکد پرتال خانوادگی' : 'Family Portal QR');
+      document.getElementById('qrModalUrl').value = url;
+      currentModalUrl = url;
+      document.getElementById('qrModalImg').src = `/api/public/qr?text=${encodeURIComponent(url)}`;
+      openModal('qrModal');
+    }
+
+    function openClientQr(id) {
+      const c = clientsData.find(item => item.id === id);
+      if (!c) return;
+      const url = c.smart_sub_link || c.json_sub_link;
+      document.getElementById('qrModalTitle').textContent = `${c.email} • QR`;
+      document.getElementById('qrModalUrl').value = url;
+      currentModalUrl = url;
+      document.getElementById('qrModalImg').src = c.smart_qr_b64 || `/api/public/qr?text=${encodeURIComponent(url)}`;
+      openModal('qrModal');
+    }
+
+    function copyModalUrl() {
+      if (!currentModalUrl) return;
+      navigator.clipboard.writeText(currentModalUrl).then(() => {
+        showToast(i18nAdmin[currentLang].copied);
+      });
+    }
+
+    function copyClientSub(link) {
+      navigator.clipboard.writeText(link).then(() => {
+        showToast(i18nAdmin[currentLang].copied);
+      });
+    }
+
+    async function handleAddMember(e) {
       e.preventDefault();
-      const payload = {{
-        name: document.getElementById('addName').value,
-        limit_gb: parseFloat(document.getElementById('addLimitGb').value || 0),
-        expiry_days: parseInt(document.getElementById('addExpiryDays').value || 0)
-      }};
-      try {{
-        const res = await fetch('/api/clients', {{
+      const name = document.getElementById('addName').value.trim();
+      const bw = parseInt(document.getElementById('addSpeedLimit').value) || 10;
+      if (!name) return;
+
+      try {
+        const res = await fetch('/api/clients', {
           method: 'POST',
-          headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify(payload)
-        }});
-        if (res.ok) {{
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({name, limit_gb: 0, expiry_days: 0, bandwidth_limit_mbps: bw})
+        });
+        if (res.ok) {
           closeModal('addMemberModal');
           document.getElementById('addName').value = '';
+          showToast(currentLang === 'fa' ? 'عضو جدید اضافه شد!' : 'Family member created!');
           fetchClients();
-          fetchAdminOverview();
-        }} else {{
+          fetchOverview();
+        } else {
           const err = await res.json();
-          alert('Error: ' + (err.detail || 'Failed to create'));
-        }}
-      }} catch (err) {{
-        alert('Error: ' + err);
-      }}
-    }}
+          alert(err.detail || 'Failed to create member');
+        }
+      } catch (err) {
+        console.error(err);
+      }
+    }
 
-    function openClientQr(clientId) {{
-      const c = clientsData.find(x => x.id === clientId);
-      if (!c) return;
-      document.getElementById('qrModalTitle').textContent = (currentLang === 'fa' ? 'اشتراک اختصاصی: ' : 'User Subscription: ') + c.email;
-      document.getElementById('qrModalImg').src = 'data:image/png;base64,' + c.smart_qr_b64;
-      document.getElementById('qrModalUrl').value = c.smart_sub_link;
-      currentModalGuide = c.farsi_instructions;
-      openModal('qrModal');
-    }}
-
-    function copyModalUrl() {{
-      const el = document.getElementById('qrModalUrl');
-      el.select();
-      navigator.clipboard.writeText(el.value).then(() => {{
-        alert(currentLang === 'fa' ? 'لینک اشتراک کپی شد!' : 'Subscription link copied to clipboard!');
-      }});
-    }}
-
-    function copyModalFarsiGuide() {{
-      if (currentModalGuide) {{
-        navigator.clipboard.writeText(currentModalGuide).then(() => {{
-          alert(currentLang === 'fa' ? 'متن راهنمای فارسی کپی شد!' : 'Farsi setup guide copied to clipboard!');
-        }});
-      }}
-    }}
-
-    function copyClientSub(url) {{
-      navigator.clipboard.writeText(url).then(() => {{
-        alert(currentLang === 'fa' ? 'لینک اشتراک کپی شد!' : 'Subscription link copied to clipboard!');
-      }});
-    }}
-
-    async function resetClientTraffic(email) {{
-      const confirmMsg = currentLang === 'fa' ? `آیا ترافیک مصرفی ${{email}} ریست شود؟` : `Reset bandwidth usage for ${{email}}?`;
-      if (!confirm(confirmMsg)) return;
-      try {{
-        const res = await fetch(`/api/clients/${{email}}/reset`, {{ method: 'POST' }});
-        if (res.ok) {{
+    async function deleteClient(id, email) {
+      if (!confirm(`Delete user ${email}?`)) return;
+      try {
+        const res = await fetch(`/api/clients/${encodeURIComponent(id)}`, {method: 'DELETE'});
+        if (res.ok) {
+          showToast('User deleted');
           fetchClients();
-          fetchAdminOverview();
-        }}
-      }} catch (e) {{
-        alert('Error: ' + e);
-      }}
-    }}
+          fetchOverview();
+        }
+      } catch (e) {
+        console.error(e);
+      }
+    }
 
-    async function deleteClient(id, email) {{
-      const confirmMsg = currentLang === 'fa' ? `آیا مطمئن هستید که حساب ${{email}} حذف شود؟` : `Are you sure you want to delete ${{email}}?`;
-      if (!confirm(confirmMsg)) return;
-      try {{
-        const res = await fetch(`/api/clients/${{id}}`, {{ method: 'DELETE' }});
-        if (res.ok) {{
+    async function resetClientTraffic(email) {
+      try {
+        const res = await fetch(`/api/clients/${encodeURIComponent(email)}/reset`, {method: 'POST'});
+        if (res.ok) {
+          showToast('Traffic reset');
           fetchClients();
-          fetchAdminOverview();
-        }}
-      }} catch (e) {{
-        alert('Error: ' + e);
-      }}
-    }}
+        }
+      } catch (e) {
+        console.error(e);
+      }
+    }
 
-    // Direct Domains Modal
-    async function openDomainsModal() {{
-      try {{
-        const res = await fetch('/api/direct-domains');
-        const data = await res.json();
-        document.getElementById('domainsTextarea').value = (data.domains || []).join(String.fromCharCode(10));
-        openModal('domainsModal');
-      }} catch (e) {{
-        alert('Error: ' + e);
-      }}
-    }}
+    async function triggerCfScan() {
+      const btn = document.getElementById('btnCfScan');
+      const st = document.getElementById('cfScanStatus');
+      btn.disabled = true;
+      st.textContent = 'Scanning 24 edge IPs...';
+      try {
+        const res = await fetch('/api/admin/cf-optimizer/scan', {method: 'POST'});
+        const d = await res.json();
+        st.textContent = `Done! Selected ${d.selected_ip} (${d.latency_ms}ms)`;
+        fetchOverview();
+      } catch (e) {
+        st.textContent = 'Scan failed';
+      } finally {
+        btn.disabled = false;
+      }
+    }
 
-    async function saveDirectDomains() {{
-      const text = document.getElementById('domainsTextarea').value;
-      const list = text.split(String.fromCharCode(10)).map(d => d.trim()).filter(d => d);
-      try {{
-        const res = await fetch('/api/direct-domains', {{
-          method: 'POST',
-          headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ domains: list }})
-        }});
-        if (res.ok) {{
-          alert(currentLang === 'fa' ? 'دامنه‌های مستقیم ذخیره و به اشتراک‌ها اعمال شدند!' : 'Direct domains saved and applied!');
-          closeModal('domainsModal');
-          fetchFailingDomains();
-        }}
-      }} catch (e) {{
-        alert('Error: ' + e);
-      }}
-    }}
-
-    // Telegram Modal
-    async function openTelegramModal() {{
-      try {{
+    async function fetchTelegramConfig() {
+      try {
         const res = await fetch('/api/telegram');
         const d = await res.json();
-        document.getElementById('tgEnabled').checked = d.enabled;
-        document.getElementById('tgChatId').value = d.chat_id || '';
-        document.getElementById('tgBotToken').placeholder = d.bot_token_masked || 'Enter Bot Token';
-        openModal('telegramModal');
-      }} catch (e) {{
-        alert('Error: ' + e);
-      }}
-    }}
+        document.getElementById('tgTokenInput').value = d.bot_token || '';
+        document.getElementById('tgChatIdInput').value = d.chat_id || '';
+        document.getElementById('tgEnabledCheckbox').checked = !!d.enabled;
+      } catch (e) {}
+    }
 
-    async function handleSaveTelegram(e) {{
-      e.preventDefault();
-      const payload = {{
-        enabled: document.getElementById('tgEnabled').checked,
-        bot_token: document.getElementById('tgBotToken').value,
-        chat_id: document.getElementById('tgChatId').value
-      }};
-      try {{
-        const res = await fetch('/api/telegram', {{
+    async function saveTelegramConfig() {
+      const bot_token = document.getElementById('tgTokenInput').value.trim();
+      const chat_id = document.getElementById('tgChatIdInput').value.trim();
+      const enabled = document.getElementById('tgEnabledCheckbox').checked;
+      try {
+        const res = await fetch('/api/telegram', {
           method: 'POST',
-          headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify(payload)
-        }});
-        if (res.ok) {{
-          alert(currentLang === 'fa' ? 'تنظیمات تلگرام ذخیره شد!' : 'Telegram settings saved!');
-          closeModal('telegramModal');
-        }}
-      }} catch (e) {{
-        alert('Error: ' + e);
-      }}
-    }}
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({bot_token, chat_id, enabled})
+        });
+        if (res.ok) showToast('Telegram config saved!');
+      } catch (e) {}
+    }
 
-    async function testTelegramAlert() {{
-      try {{
-        const res = await fetch('/api/telegram/test', {{ method: 'POST' }});
+    async function testTelegramAlert() {
+      const st = document.getElementById('tgTestStatus');
+      st.textContent = 'Sending test alert...';
+      try {
+        const res = await fetch('/api/telegram/test', {method: 'POST'});
         const d = await res.json();
-        if (res.ok && d.success) {{
-          alert(currentLang === 'fa' ? 'پیام تست به تلگرام شما ارسال شد! تلگرام خود را بررسی کنید.' : 'Test message sent to Telegram successfully!');
-        }} else {{
-          alert('Error: ' + (d.detail || d.message));
-        }}
-      }} catch (e) {{
-        alert('Error: ' + e);
-      }}
-    }}
+        st.textContent = d.success ? 'Alert delivered to Telegram!' : 'Failed: ' + d.error;
+      } catch (e) {
+        st.textContent = 'Error testing Telegram';
+      }
+    }
 
-function copyToClipboard(text, btnId) {{
-      if (!text) return;
-      navigator.clipboard.writeText(text).then(() => {{
-        const btn = document.getElementById(btnId);
-        if (btn) {{
-          const orig = btn.textContent;
-          btn.textContent = (currentLang === 'fa' ? 'کپی شد!' : 'Copied!');
-          setTimeout(() => {{ btn.textContent = orig; }}, 2000);
-        }}
-      }});
-    }}
+    async function fetchDirectDomains() {
+      try {
+        const res = await fetch('/api/direct-domains');
+        const d = await res.json();
+        document.getElementById('directDomainsTextarea').value = (d.domains || []).join('\n');
+      } catch (e) {}
+    }
 
-    function shareViaWhatsApp() {{
-      const portalUrl = currentPublicUrl && currentPublicUrl.startsWith('https://') ? currentPublicUrl : (currentShareableLink || currentLanUrl);
-      const text = currentLang === 'fa'
-        ? `سلام! فیلترشکن اختصاصی و خانگی ما راه‌اندازی شد.
-لینک پورتال و ثبت‌نام هوشمند:
-${{portalUrl}}
-
-کد دعوت خانوادگی: ${{currentInviteCode}}
-
-پس از ثبت‌نام، لینک اشتراک اختصاصی خود را در اپلیکیشن‌های زیر وارد کنید:
-• اندروید/ویندوز: Hiddify یا v2rayNG
-• آیفون (iOS): Streisand یا V2Box
-تمامی ترافیک بانکی و سایت‌های ایرانی به صورت مستقیم و بدون مصرف حجم باز می‌شوند.`
-        : `Hi! Our private Home Family VPN is up and running.
-Portal & Smart Signup:
-${{portalUrl}}
-
-Family Invite Code: ${{currentInviteCode}}
-
-After creating your account, import your personal subscription into:
-• Android / Windows: Hiddify or v2rayNG
-• iPhone (iOS): Streisand or V2Box
-Domestic Iranian sites & banking apps bypass the VPN automatically.`;
-
-      window.open('https://wa.me/?text=' + encodeURIComponent(text), '_blank');
-    }}
-
-    function shareViaTelegram() {{
-      const portalUrl = currentPublicUrl && currentPublicUrl.startsWith('https://') ? currentPublicUrl : (currentShareableLink || currentLanUrl);
-      const text = currentLang === 'fa'
-        ? `سلام! فیلترشکن اختصاصی و خانگی ما راه‌اندازی شد.
-کد دعوت: ${{currentInviteCode}}
-پس از ثبت‌نام در پورتال، اشتراک هوشمند خود را در Hiddify یا Streisand فعال کنید.`
-        : `Hi! Our private Home Family VPN is up and running.
-Invite Code: ${{currentInviteCode}}
-After registering, import your smart subscription into Hiddify or Streisand.`;
-
-      window.open('https://t.me/share/url?url=' + encodeURIComponent(portalUrl) + '&text=' + encodeURIComponent(text), '_blank');
-    }}
-
-    // Portal QR Modal
-    function openPortalQrModal() {{
-      currentActiveQrType = 'public';
-      updatePortalQrDisplay();
-      openModal('portalQrModal');
-    }}
-
-    function switchPortalQr(type) {{
-      currentActiveQrType = type;
-      updatePortalQrDisplay();
-    }}
-
-    function updatePortalQrDisplay() {{
-      const isPublic = (currentActiveQrType === 'public');
-      const url = isPublic
-        ? (currentPublicUrl && currentPublicUrl.startsWith('https://') ? currentPublicUrl : (currentShareableLink || currentLocalUrl))
-        : currentLanUrl;
-
-      const btnPub = document.getElementById('btnQrTabPublic');
-      const btnLan = document.getElementById('btnQrTabLan');
-      if (isPublic) {{
-        btnPub.className = 'flex-1 py-1.5 rounded-lg bg-indigo-600 text-white font-bold transition';
-        btnLan.className = 'flex-1 py-1.5 rounded-lg text-slate-400 font-bold transition';
-      }} else {{
-        btnPub.className = 'flex-1 py-1.5 rounded-lg text-slate-400 font-bold transition';
-        btnLan.className = 'flex-1 py-1.5 rounded-lg bg-cyan-600 text-white font-bold transition';
-      }}
-
-      document.getElementById('portalQrUrl').textContent = url;
-      document.getElementById('portalQrImg').src = '/api/public/qr?text=' + encodeURIComponent(url);
-    }}
-
-    // Backup & Restore
-    function openBackupModal() {{
-      openModal('backupModal');
-    }}
-
-    function downloadBackupFile() {{
-      window.location.href = '/api/admin/backup';
-    }}
-
-    function handleBackupFileSelect(event) {{
-      const file = event.target.files[0];
-      if (!file) return;
-      document.getElementById('selectedFileName').textContent = file.name;
-      const reader = new FileReader();
-      reader.onload = function(e) {{
-        document.getElementById('restoreJsonTextarea').value = e.target.result;
-      }};
-      reader.readAsText(file);
-    }}
-
-    async function executeRestore() {{
-      const text = document.getElementById('restoreJsonTextarea').value.trim();
-      if (!text) {{
-        alert(currentLang === 'fa' ? 'لطفاً فایل پشتیبان را انتخاب کنید یا محتوای JSON را وارد نمایید.' : 'Please select a backup file or paste JSON content.');
-        return;
-      }}
-      const confirmMsg = currentLang === 'fa' ? 'آیا از بازیابی اطلاعات اطمینان دارید؟ کاربران و تنظیمات بروزرسانی خواهند شد.' : 'Are you sure you want to restore? Users and settings will be updated.';
-      if (!confirm(confirmMsg)) return;
-
-      const btn = document.getElementById('btnExecuteRestore');
-      btn.disabled = true;
-      btn.textContent = (currentLang === 'fa' ? 'در حال بازیابی...' : 'Restoring...');
-      try {{
-        const res = await fetch('/api/admin/restore', {{
+    async function saveDirectDomains() {
+      const raw = document.getElementById('directDomainsTextarea').value;
+      const domains = raw.split('\n').map(x => x.trim()).filter(Boolean);
+      try {
+        const res = await fetch('/api/direct-domains', {
           method: 'POST',
-          headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ backup_json: text }})
-        }});
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({domains})
+        });
+        if (res.ok) showToast('Direct domains updated!');
+      } catch (e) {}
+    }
+
+    async function fetchDiagnostics() {
+      const out = document.getElementById('diagOutput');
+      out.textContent = 'Loading live Xray logs...';
+      try {
+        const res = await fetch('/api/diagnostics/logs?limit=50');
         const d = await res.json();
-        if (res.ok && d.success) {{
-          alert(d.message);
-          closeModal('backupModal');
-          fetchAdminOverview();
-          fetchClients();
-        }} else {{
-          alert('Error: ' + (d.detail || d.message));
-        }}
-      }} catch (e) {{
-        alert('Restore error: ' + e);
-      }} finally {{
-        btn.disabled = false;
-        btn.textContent = i18nAdmin[currentLang].btnRestoreText;
-      }}
-    }}
+        out.textContent = (d.logs || []).map(l => `[${l.time}] [${l.level}] ${l.message}`).join('\n') || 'No logs recorded.';
+      } catch (e) {
+        out.textContent = 'Failed to load logs.';
+      }
+    }
 
-    // Diagnostics Modal
-    async function openDiagModal() {{
-      openModal('diagModal');
-      loadDiagLogs();
-    }}
-
-    async function loadDiagLogs() {{
-      const box = document.getElementById('diagLogBox');
-      box.textContent = i18nAdmin[currentLang].diagLoading;
-      try {{
-        const res = await fetch('/api/diagnostics/logs?limit=80');
-        const d = await res.json();
-        const entries = d.entries || [];
-        box.innerHTML = entries.map(e => {{
-          const leakBadge = e.is_leak ? '<span class="text-rose-400 font-bold">[!IR_LEAK!]</span> ' : '';
-          return `<div>[${{e.timestamp}}] <span class="text-indigo-400">${{e.email}}</span> → <span class="text-white">${{e.destination}}</span> [${{e.route}}] ${{leakBadge}}${{e.status}}</div>`;
-        }}).join('');
-      }} catch (e) {{
-        box.textContent = 'Error loading logs: ' + e;
-      }}
-    }}
-
-    async function copyRedactedReport() {{
-      try {{
-        const res = await fetch('/api/diagnostics/report');
-        const text = await res.text();
-        navigator.clipboard.writeText(text).then(() => {{
-          alert(currentLang === 'fa' ? 'گزارش عیب‌یابی بدون اطلاعات حساس کپی شد!' : 'Sanitized diagnostic report copied to clipboard!');
-        }});
-      }} catch (e) {{
-        alert('Error: ' + e);
-      }}
-    }}
-
-    window.addEventListener('DOMContentLoaded', () => {{
-      const urlParams = new URLSearchParams(window.location.search);
-      const qLang = urlParams.get('lang');
-      if (qLang && (qLang === 'en' || qLang === 'fa')) {{
-        currentLang = qLang;
-        localStorage.setItem('vpn_lang', qLang);
-      }} else {{
-        currentLang = localStorage.getItem('vpn_lang') || 'fa';
-      }}
-      setLanguage(currentLang);
-
-      fetchAdminOverview();
-      fetchClients();
-      fetchFailingDomains();
-      setInterval(fetchAdminOverview, 10000);
-      setInterval(fetchClients, 12000);
-      setInterval(fetchFailingDomains, 20000);
-    }});
+    setLanguage(currentLang);
+    fetchOverview();
+    fetchClients();
+    setInterval(fetchOverview, 15000);
+    setInterval(fetchClients, 20000);
   </script>
 </body>
-</html>"""
-
-
-# ----------------- 4. DEDICATED BILINGUAL HELP & GUIDE PAGE ----------------- #
+</html>""".replace("__COMMON_HEADER__", COMMON_HEADER_HTML)
 
 HELP_PAGE_HTML = """<!DOCTYPE html>
 <html lang="fa" dir="rtl" class="dark">
