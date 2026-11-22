@@ -888,6 +888,260 @@ def send_telegram_alert_async(message: str):
 
     threading.Thread(target=_send, daemon=True).start()
 
+last_notified_portal_url = None
+
+def send_admin_portal_startup_alert(portal_url: str, force: bool = False):
+    """Sends a comprehensive executive notification to the admin via Telegram when portal URL is active/changed."""
+    global last_notified_portal_url
+    if not portal_url:
+        return
+    clean_host = portal_url.replace("https://", "").replace("http://", "").strip("/")
+    if not force and clean_host == last_notified_portal_url:
+        return
+    last_notified_portal_url = clean_host
+
+    def _worker():
+        try:
+            cfg = load_telegram_config()
+            if not cfg.get("enabled"):
+                return
+            token = cfg.get("bot_token", "").strip()
+            chat_id = str(cfg.get("chat_id", "")).strip()
+            if not token or not chat_id:
+                return
+
+            vpn_host = get_clean_vpn_host()
+            clean_ips = get_active_clean_ips()
+            best_ip = clean_ips[0][0] if clean_ips else "172.67.188.112"
+            opt_state = get_cf_optimizer_state()
+            lat = int(opt_state.get("latency_ms", 63) or 63)
+            invite_code = get_invite_code()
+
+            # Fetch client summary
+            clients_info = get_clients_list_internal()
+            total_members = len(clients_info.get("clients", []))
+            online_count = sum(1 for c in clients_info.get("clients", []) if c.get("is_online"))
+            total_bw = clients_info.get("total_used_str", "0 B")
+
+            admin_url = f"https://{clean_host}/admin"
+            public_url = f"https://{clean_host}/?invite={invite_code}"
+
+            msg = (
+                "🚀 <b>سامانه فیلترشکن خانواده فعال شد!</b>\n\n"
+                f"🔐 <b>ورود به پنل مدیریت (ادمین):</b>\n"
+                f"<a href=\"{admin_url}\">{admin_url}</a>\n\n"
+                "👤 <b>نام کاربری:</b> <code>admin</code> یا <code>Tohid</code>\n"
+                "🔑 <b>رمز عبور:</b> <code>75547554</code>\n"
+                f"🎫 <b>کد دعوت اختصاصی:</b> <code>{invite_code}</code>\n\n"
+                f"🌐 <b>آدرس عمومی پورتال:</b>\n"
+                f"{public_url}\n\n"
+                "🛡️ <b>وضعیت اتصال و شبکه:</b>\n"
+                f"• سرور تونل VLESS: <code>{vpn_host}</code>\n"
+                f"• آی‌پی تمیز کلودفلر: <code>{best_ip}</code> (پینگ: {lat} ms)\n"
+                f"• اعضای خانواده: <b>{total_members} نفر</b> (🟢 {online_count} آنلاین)\n"
+                f"• حجم کل مصرف‌شده: <b>{total_bw}</b>\n\n"
+                "🤖 <b>دستورات سریع ربات تلگرام:</b>\n"
+                "/admin - دریافت لینک مدیریت جدید\n"
+                "/status - وضعیت سلامت تونل و سیستم\n"
+                "/users - لیست مصرف کاربران خانواده\n"
+                "/scan - اسکن و انتخاب سریع‌ترین آی‌پی کلودفلر"
+            )
+
+            send_telegram_alert_async(msg)
+        except Exception as e:
+            print(f"[Admin Startup Alert Error] {e}")
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+def handle_telegram_command(token: str, chat_id: str, text: str):
+    """Processes interactive Telegram commands from the administrator."""
+    cmd = (text or "").strip().lower()
+    portal_host = get_clean_portal_host() or "Connecting..."
+    vpn_host = get_clean_vpn_host()
+    clean_ips = get_active_clean_ips()
+    best_ip = clean_ips[0][0] if clean_ips else "172.67.188.112"
+    opt_state = get_cf_optimizer_state()
+    lat = int(opt_state.get("latency_ms", 63) or 63)
+    invite_code = get_invite_code()
+    admin_url = f"https://{portal_host}/admin" if portal_host != "Connecting..." else "در حال راه‌اندازی..."
+
+    if cmd in ("/start", "/help", "راهنما", "شروع"):
+        reply = (
+            "👋 <b>سلام آقا توحید! به ربات مدیریت فیلترشکن خانواده خوش آمدید.</b>\n\n"
+            "⚙️ <b>دستورات قابل استفاده:</b>\n\n"
+            "🔗 /admin یا /link - دریافت فوری لینک جدید پنل ادمین و اطلاعات ورود\n"
+            "📊 /status - بررسی وضعیت آنلاین پورتال، تونل VLESS و آی‌پی تمیز\n"
+            "👥 /users - مشاهده وضعیت و ترافیک مصرفی تک‌تک اعضای خانواده\n"
+            "⚡ /scan - اسکن ۲۴ آی‌پی Anycast کلودفلر و انتخاب کمترین تاخیر"
+        )
+    elif cmd in ("/admin", "/link", "لینک", "ادمین", "پنل"):
+        reply = (
+            "🔐 <b>مشخصات و لینک ورود به پنل مدیریت (ادمین):</b>\n\n"
+            f"🔗 <b>لینک ورود مستقیم:</b>\n"
+            f"<a href=\"{admin_url}\">{admin_url}</a>\n\n"
+            "👤 <b>نام کاربری:</b> <code>admin</code> یا <code>Tohid</code>\n"
+            "🔑 <b>رمز عبور:</b> <code>75547554</code>\n"
+            f"🎫 <b>کد دعوت اعضا:</b> <code>{invite_code}</code>\n"
+            f"🌐 <b>پورتال عمومی:</b> https://{portal_host}"
+        )
+    elif cmd in ("/status", "وضعیت", "استاتوس"):
+        clients_info = get_clients_list_internal()
+        total_members = len(clients_info.get("clients", []))
+        online_count = sum(1 for c in clients_info.get("clients", []) if c.get("is_online"))
+        total_bw = clients_info.get("total_used_str", "0 B")
+        watchdog = tunnel_state.get("watchdog_status", "Healthy")
+
+        reply = (
+            "📊 <b>گزارش لحظه‌ای وضعیت سامانه فیلترشکن خانواده:</b>\n\n"
+            f"🌐 <b>پورتال مدیریت وب:</b> 🟢 آنلاین\n"
+            f"<code>https://{portal_host}</code>\n\n"
+            f"🛡️ <b>هسته تونل VLESS:</b> 🟢 فعال\n"
+            f"<code>{vpn_host}</code>\n\n"
+            f"⚡ <b>سریع‌ترین آی‌پی کلودفلر:</b> <code>{best_ip}</code>\n"
+            f"⏱️ <b>تاخیر (Latency):</b> {lat} ms\n\n"
+            f"👥 <b>آمار کاربران:</b>\n"
+            f"• کل اعضا: <b>{total_members} نفر</b>\n"
+            f"• متصل در حال حاضر: <b>🟢 {online_count} نفر</b>\n"
+            f"• حجم کل ترافیک: <b>{total_bw}</b>\n\n"
+            f"🩺 <b>وضعیت خودکار واچ‌داگ:</b> {watchdog}"
+        )
+    elif cmd in ("/users", "کاربران", "اعضا"):
+        clients_info = get_clients_list_internal()
+        clients_list = clients_info.get("clients", [])
+        if not clients_list:
+            reply = "👥 <b>هیچ کاربری در سامانه یافت نشد.</b>"
+        else:
+            lines = ["👥 <b>وضعیت اعضای خانواده:</b>\n"]
+            for idx, c in enumerate(clients_list, 1):
+                name = c.get("name") or c.get("email")
+                email = c.get("email")
+                status = "🟢 آنلاین" if c.get("is_online") else (f"🟡 آخرین اتصال: {c.get('last_seen_fa')}" if c.get("last_seen_fa") != "تاکنون متصل نشده" else "⚪ آماده اتصال")
+                ip = c.get("last_ip") or "ثبت نشده"
+                used = c.get("total_used_str", "0 B")
+                up = c.get("up_str", "0 B")
+                down = c.get("down_str", "0 B")
+                bw = c.get("bandwidth_limit_mbps", 10)
+                bw_str = f"{bw} Mbps" if bw > 0 else "نامحدود"
+                sub = c.get("json_sub_link", "")
+
+                lines.append(
+                    f"{idx}. <b>{name}</b>\n"
+                    f"   • وضعیت: {status}\n"
+                    f"   • آخرین آی‌پی: <code>{ip}</code>\n"
+                    f"   • مصرف ترافیک: <b>{used}</b> (↑ {up} | ↓ {down})\n"
+                    f"   • سقف سرعت: {bw_str}\n"
+                    f"   • لینک اشتراک: <code>{sub}</code>\n"
+                )
+            reply = "\n".join(lines)
+    elif cmd in ("/scan", "اسکن", "بهینه‌سازی"):
+        # Send initial progress notice
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={
+                    "chat_id": chat_id,
+                    "text": "⏳ <b>در حال اسکن ۲۴ آی‌پی Anycast کلودفلر...</b>\nلطفا چند ثانیه صبور باشید.",
+                    "parse_mode": "HTML"
+                },
+                timeout=5
+            )
+        except Exception:
+            pass
+
+        scan_res = run_cloudflare_ip_scan()
+        best_ip = scan_res.get("active_ip") or "172.67.188.112"
+        lat = int(scan_res.get("latency_ms", 63) or 63)
+
+        reply = (
+            "⚡ <b>اسکن و بهینه‌سازی آی‌پی کلودفلر تکمیل شد!</b>\n\n"
+            f"🎯 <b>سریع‌ترین آی‌پی تمیز:</b> <code>{best_ip}</code>\n"
+            f"⏱️ <b>کمترین تاخیر (Ping):</b> <b>{lat} ms</b>\n\n"
+            "🔄 تمام کانفیگ‌ها و لینک‌های اشتراک اعضای خانواده به طور خودکار به این آی‌پی سوئیچ شدند."
+        )
+    else:
+        reply = (
+            "❓ <b>دستور نامعتبر است.</b>\n\n"
+            "دستورات مجاز:\n"
+            "/admin - لینک ورود به پنل ادمین\n"
+            "/status - وضعیت سلامت تونل و سیستم\n"
+            "/users - لیست مصرف کاربران خانواده\n"
+            "/scan - اسکن و انتخاب بهترین آی‌پی کلودفلر"
+        )
+
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {
+            "chat_id": chat_id,
+            "text": reply,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True
+        }
+        requests.post(url, json=payload, timeout=8)
+    except Exception as e:
+        print(f"[Telegram Command Reply Error] {e}")
+
+def telegram_bot_poller():
+    """Background long-polling worker to receive and process Telegram bot commands."""
+    offset = 0
+    time.sleep(3)
+    while True:
+        try:
+            cfg = load_telegram_config()
+            if not cfg.get("enabled"):
+                time.sleep(10)
+                continue
+            token = cfg.get("bot_token", "").strip()
+            allowed_chat_id = str(cfg.get("chat_id", "")).strip()
+            if not token or not allowed_chat_id:
+                time.sleep(10)
+                continue
+
+            url = f"https://api.telegram.org/bot{token}/getUpdates"
+            params = {"offset": offset, "timeout": 20}
+            resp = requests.get(url, params=params, timeout=25)
+            if resp.status_code != 200:
+                time.sleep(5)
+                continue
+
+            data = resp.json()
+            if not data.get("ok"):
+                time.sleep(5)
+                continue
+
+            for update in data.get("result", []):
+                offset = update["update_id"] + 1
+                msg = update.get("message")
+                if not msg:
+                    continue
+
+                from_chat_id = str(msg.get("chat", {}).get("id", ""))
+                text = (msg.get("text") or "").strip()
+
+                if from_chat_id != allowed_chat_id:
+                    try:
+                        requests.post(
+                            f"https://api.telegram.org/bot{token}/sendMessage",
+                            json={
+                                "chat_id": from_chat_id,
+                                "text": "⛔ دسترسی غیرمجاز. این بات خصوصی سامانه فیلترشکن خانواده است."
+                            },
+                            timeout=5
+                        )
+                    except Exception:
+                        pass
+                    continue
+
+                handle_telegram_command(token, from_chat_id, text)
+
+        except requests.RequestException:
+            time.sleep(5)
+        except Exception as e:
+            print(f"[Telegram Poller Loop Exception] {e}")
+            time.sleep(5)
+
+threading.Thread(target=telegram_bot_poller, daemon=True).start()
+
+
 # ----------------- 3x-ui API Client & Base Path ----------------- #
 
 def get_xui_base_path() -> str:
@@ -1478,6 +1732,7 @@ def detect_tunnel_urls_from_logs():
                         tunnel_state["portal_url"] = f"https://{host}"
                         tunnel_state["sub_host"] = host
                         tunnel_state["sub_url"] = f"https://{host}"
+                        send_admin_portal_startup_alert(f"https://{host}")
                 if not tunnel_state.get("vpn_host"):
                     m_vpn = re.search(r"(?:VPN Tunnel Active:\s*|vpn.*?)https://([a-zA-Z0-9-]+\.trycloudflare\.com)", line, re.I)
                     if m_vpn:
@@ -1594,8 +1849,7 @@ def stream_reader(proc, name, is_vpn=True):
                     tunnel_state["portal_host"] = host
                     tunnel_state.pop("sub_error", None)
                     print(f"[TUNNEL] Admin Portal & Sub Tunnel Active: {url}")
-                    if old_sub and old_sub != host:
-                        send_telegram_alert_async(f"🌐 <b>Family VPN Portal Updated!</b>\nNew Remote URL: {url}")
+                    send_admin_portal_startup_alert(url)
 
                 tunnel_state["last_sync"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 sync_3xui_with_tunnels()
@@ -2720,11 +2974,11 @@ def api_admin_overview(request: Request):
     except Exception as e:
         print(f"[Admin Overview 3x-ui Error] {e}")
 
-    total_users_count = max(total_db_users, client_count)
-
-    # Online users
-    activity_map = get_all_users_activity()
-    online_count = sum(1 for v in activity_map.values() if v.get("is_online"))
+    # Fetch clean deduplicated clients
+    clients_data = get_clients_list_internal()
+    clients_list = clients_data.get("clients", [])
+    total_users_count = len(clients_list)
+    online_count = sum(1 for c in clients_list if c.get("is_online"))
 
     # Failing / leaked domains count
     failing_domains = get_failing_and_leaked_domains(limit=50)
@@ -2858,17 +3112,18 @@ def api_set_cf_ip_override(req: CfIpOverrideReq):
         )
     return {"success": True, "ip": clean_ip, "active_ip": get_active_clean_ips()[0][0]}
 
-@app.get("/api/clients")
-def list_clients(request: Request):
-    update_tunnel_state_from_request(request)
-    detect_tunnel_urls_from_logs()
-
-    session = get_session(request)
-    if session:
-        record_user_activity(session.get("email", "admin"), request)
-        if session.get("role") == "admin" or session.get("username", "").lower() in ["admin", "tohid"]:
-            record_user_activity("admin", request)
-            record_user_activity("tohid", request)
+def get_clients_list_internal(request: Optional[Request] = None):
+    if request is not None:
+        update_tunnel_state_from_request(request)
+        detect_tunnel_urls_from_logs()
+        session = get_session(request)
+        if session:
+            record_user_activity(session.get("email", "admin"), request)
+            if session.get("role") == "admin" or session.get("username", "").lower() in ["admin", "tohid"]:
+                record_user_activity("admin", request)
+                record_user_activity("tohid", request)
+    else:
+        detect_tunnel_urls_from_logs()
 
     user_bw_map = {}
     db_users = []
@@ -2930,6 +3185,25 @@ def list_clients(request: Request):
     stats_map = {cs.get("email"): cs for cs in client_stats if cs.get("email")}
     activity_map = get_all_users_activity()
 
+    db_name_map = {}
+    for u in db_users:
+        if u.get("email"):
+            db_name_map[u["email"].lower()] = u.get("name")
+        if u.get("uuid"):
+            db_name_map[u["uuid"]] = u.get("name")
+
+    # Deduplicate admin and Tohid
+    seen_admin = False
+    clean_raw_clients = []
+    for c in raw_clients:
+        em = (c.get("email") or "").lower()
+        if em in ("admin", "tohid"):
+            if seen_admin:
+                continue
+            seen_admin = True
+        clean_raw_clients.append(c)
+    raw_clients = clean_raw_clients
+
     result = []
     total_up = 0
     total_down = 0
@@ -2975,8 +3249,31 @@ def list_clients(request: Request):
         if expiry_ms > 0:
             expiry_str = datetime.datetime.fromtimestamp(expiry_ms / 1000.0).strftime("%Y-%m-%d")
 
+        # Friendly name mapping
+        em_lower = email.lower()
+        if em_lower in ("admin", "tohid"):
+            friendly_name = "توحید (مدیر)"
+        elif "moriss" in em_lower:
+            friendly_name = "جواد (7moriss)"
+        elif "saeideh" in em_lower or "ciicii" in em_lower:
+            friendly_name = "سعیده (CiiCii)"
+        else:
+            friendly_name = db_name_map.get(em_lower) or db_name_map.get(client_uuid) or email
+
+        # Granular status badges
+        if is_online:
+            status_badge_fa = "🟢 آنلاین"
+            status_badge_en = "🟢 Online"
+        elif last_seen_fa and last_seen_fa != "تاکنون متصل نشده":
+            status_badge_fa = f"🟡 {last_seen_fa}"
+            status_badge_en = f"🟡 {last_seen_en}"
+        else:
+            status_badge_fa = "⚪ آماده اتصال"
+            status_badge_en = "⚪ Ready"
+
         result.append({
             "id": client_uuid,
+            "name": friendly_name,
             "email": email,
             "subId": sub_id,
             "up": up,
@@ -2991,6 +3288,8 @@ def list_clients(request: Request):
             "expiry_time": expiry_ms,
             "expiry_str": expiry_str,
             "status": status,
+            "status_badge_fa": status_badge_fa,
+            "status_badge_en": status_badge_en,
             "is_online": is_online,
             "last_seen_en": last_seen_en,
             "last_seen_fa": last_seen_fa,
@@ -3013,6 +3312,10 @@ def list_clients(request: Request):
         "total_up_str": format_bytes(total_up),
         "total_down_str": format_bytes(total_down)
     }
+
+@app.get("/api/clients")
+def list_clients(request: Request):
+    return get_clients_list_internal(request)
 
 class ClientCreateReq(BaseModel):
     name: str
@@ -4493,8 +4796,13 @@ ADMIN_PAGE_HTML = """<!DOCTYPE html>
         </button>
       </div>
 
-      <!-- Table Container -->
-      <div class="overflow-x-auto rounded-2xl border border-white/[0.06]">
+      <!-- Mobile Cards View (Visible on small screens) -->
+      <div id="clientsMobileCards" class="block sm:hidden space-y-3">
+        <div class="p-6 text-center text-slate-500">در حال بارگذاری کاربران...</div>
+      </div>
+
+      <!-- Desktop Table View (Visible on sm and larger screens) -->
+      <div class="hidden sm:block overflow-x-auto rounded-2xl border border-white/[0.06]">
         <table class="w-full text-xs text-slate-300">
           <thead class="bg-white/[0.02] border-b border-white/[0.06] text-slate-400 font-semibold uppercase tracking-wider text-[11px]">
             <tr>
@@ -4917,61 +5225,136 @@ ADMIN_PAGE_HTML = """<!DOCTYPE html>
 
     function renderClientsTable(list) {
       const tbody = document.getElementById('clientsTableBody');
-      if (!tbody) return;
+      const mobileContainer = document.getElementById('clientsMobileCards');
+
       if (!list || list.length === 0) {
-        tbody.innerHTML = `<tr><td colspan="5" class="p-8 text-center text-slate-500">${i18nAdmin[currentLang].emptyUsers}</td></tr>`;
+        if (tbody) tbody.innerHTML = `<tr><td colspan="5" class="p-8 text-center text-slate-500">${i18nAdmin[currentLang].emptyUsers}</td></tr>`;
+        if (mobileContainer) mobileContainer.innerHTML = `<div class="p-8 text-center text-slate-500">${i18nAdmin[currentLang].emptyUsers}</div>`;
         return;
       }
 
-      tbody.innerHTML = list.map(c => {
-        const isOnline = c.is_online;
-        const onlineDot = isOnline
-          ? `<span class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-[10px] font-bold"><span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>${currentLang === 'fa' ? 'آنلاین' : 'Online'}</span>`
-          : `<span class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-white/[0.04] text-slate-400 border border-white/[0.06] text-[10px]">${currentLang === 'fa' ? 'آفلاین' : 'Offline'}</span>`;
+      // 1. Render Mobile Cards View
+      if (mobileContainer) {
+        mobileContainer.innerHTML = list.map(c => {
+          const isOnline = c.is_online;
+          const statusBadge = isOnline
+            ? `<span class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-[10px] font-bold"><span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>${currentLang === 'fa' ? 'آنلاین (متصل)' : 'Online'}</span>`
+            : (c.last_seen_fa && c.last_seen_fa !== 'تاکنون متصل نشده'
+              ? `<span class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-amber-500/10 text-amber-300 border border-amber-500/20 text-[10px] font-medium">${currentLang === 'fa' ? c.last_seen_fa : c.last_seen_en}</span>`
+              : `<span class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-white/[0.04] text-slate-400 border border-white/[0.06] text-[10px]">${currentLang === 'fa' ? 'آماده اتصال' : 'Ready'}</span>`);
 
-        const bw = (c.bandwidth_limit_mbps !== undefined && c.bandwidth_limit_mbps !== null) ? c.bandwidth_limit_mbps : 10;
-        
-        return `
-          <tr class="hover:bg-white/[0.02] transition">
-            <td class="p-3.5 text-start">
-              <div class="font-bold text-white text-xs select-all">${c.email}</div>
-              <div class="text-[10px] text-slate-400 font-mono mt-1.5 flex items-center gap-2 flex-wrap">
-                <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-indigo-500/15 text-indigo-300 border border-indigo-500/30 text-[10px] font-semibold">
-                  <span class="text-slate-400 font-normal">${i18nAdmin[currentLang].connectedIpLabel}</span>
-                  <span class="font-mono font-bold select-all text-white">${c.last_ip && c.last_ip !== '---' ? c.last_ip : i18nAdmin[currentLang].notRecorded}</span>
-                </span>
-                <span class="text-slate-500">•</span>
-                <span class="text-slate-400 text-[10px]">${currentLang === 'fa' ? (c.last_seen_fa || 'تاکنون متصل نشده') : (c.last_seen_en || 'Never connected')}</span>
+          const bw = (c.bandwidth_limit_mbps !== undefined && c.bandwidth_limit_mbps !== null) ? c.bandwidth_limit_mbps : 10;
+          const displayName = c.name || c.email;
+
+          return `
+            <div class="p-4 space-y-3 bg-white/[0.02] hover:bg-white/[0.04] rounded-2xl border border-white/[0.06] transition">
+              <div class="flex items-center justify-between gap-2">
+                <div>
+                  <div class="font-bold text-white text-sm">${displayName}</div>
+                  <div class="text-[11px] text-slate-400 font-mono select-all">${c.email}</div>
+                </div>
+                <div>${statusBadge}</div>
               </div>
-            </td>
-            <td class="p-3.5 text-center">
-              <div>${onlineDot}</div>
-            </td>
-            <td class="p-3.5 text-start">
-              <div class="font-bold text-slate-200 text-xs">${c.total_used_str || '0 B'}</div>
-              <div class="text-[10px] text-slate-500 font-mono">↑ ${c.up_str || '0 B'} | ↓ ${c.down_str || '0 B'}</div>
-            </td>
-            <td class="p-3.5 text-center">
-              <select onchange="updateClientBandwidth('${c.email}', this.value)" class="px-2.5 py-1 rounded-lg bg-slate-950 border border-white/[0.1] text-xs font-semibold text-indigo-300 focus:outline-none focus:border-indigo-500 cursor-pointer">
-                <option value="5" ${bw === 5 ? 'selected' : ''}>5 Mbps</option>
-                <option value="10" ${bw === 10 ? 'selected' : ''}>10 Mbps (Default)</option>
-                <option value="20" ${bw === 20 ? 'selected' : ''}>20 Mbps</option>
-                <option value="25" ${bw === 25 ? 'selected' : ''}>25 Mbps</option>
-                <option value="50" ${bw === 50 ? 'selected' : ''}>50 Mbps</option>
-                <option value="0" ${bw === 0 ? 'selected' : ''}>${i18nAdmin[currentLang].unlimited}</option>
-              </select>
-            </td>
-            <td class="p-3.5 text-center">
-              <div class="inline-flex items-center gap-1.5 justify-center">
-                <button onclick="openClientQr('${c.id}')" class="px-2 py-1 rounded-lg bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/30 text-[11px] font-semibold transition">QR</button>
-                <button onclick="copyClientSub('${c.smart_sub_link}')" class="px-2 py-1 rounded-lg bg-white/[0.05] hover:bg-white/[0.1] text-slate-300 border border-white/[0.08] text-[11px] font-semibold transition">Copy</button>
-                <button onclick="resetClientTraffic('${c.email}')" class="px-2 py-1 rounded-lg bg-white/[0.05] hover:bg-white/[0.1] text-cyan-300 border border-white/[0.08] text-[11px] font-semibold transition">Reset</button>
-                <button onclick="deleteClient('${c.id}', '${c.email}')" class="px-2 py-1 rounded-lg bg-rose-950/40 hover:bg-rose-900/60 text-rose-300 border border-rose-800/80 text-[11px] font-semibold transition">Delete</button>
+
+              <div class="grid grid-cols-2 gap-2 text-[11px] bg-slate-950/60 p-2.5 rounded-xl border border-white/[0.04]">
+                <div>
+                  <span class="text-slate-500 block text-[10px]">${currentLang === 'fa' ? 'آخرین آی‌پی متصل:' : 'Connected IP:'}</span>
+                  <span class="font-mono font-bold select-all text-indigo-300 text-xs">${c.last_ip && c.last_ip !== '---' ? c.last_ip : (currentLang === 'fa' ? 'ثبت نشده' : 'Not recorded')}</span>
+                </div>
+                <div>
+                  <span class="text-slate-500 block text-[10px]">${currentLang === 'fa' ? 'مصرف کل داده:' : 'Total Usage:'}</span>
+                  <span class="font-bold text-slate-200 text-xs">${c.total_used_str || '0 B'}</span>
+                </div>
               </div>
-            </td>
-          </tr>
-        `;
-      }).join('');
+
+              <div class="flex items-center justify-between gap-2 pt-2 border-t border-white/[0.04] flex-wrap">
+                <div class="flex items-center gap-1.5">
+                  <span class="text-[10px] text-slate-500">${currentLang === 'fa' ? 'سقف سرعت:' : 'Speed:'}</span>
+                  <select onchange="updateClientBandwidth('${c.email}', this.value)" class="px-2 py-0.5 rounded-lg bg-slate-900 border border-white/[0.1] text-[11px] font-semibold text-indigo-300 focus:outline-none">
+                    <option value="5" ${bw === 5 ? 'selected' : ''}>5 Mbps</option>
+                    <option value="10" ${bw === 10 ? 'selected' : ''}>10 Mbps</option>
+                    <option value="20" ${bw === 20 ? 'selected' : ''}>20 Mbps</option>
+                    <option value="25" ${bw === 25 ? 'selected' : ''}>25 Mbps</option>
+                    <option value="50" ${bw === 50 ? 'selected' : ''}>50 Mbps</option>
+                    <option value="0" ${bw === 0 ? 'selected' : ''}>${i18nAdmin[currentLang].unlimited}</option>
+                  </select>
+                </div>
+                <div class="flex items-center gap-1.5">
+                  <button onclick="copyClientSub('${c.smart_sub_link}')" class="px-2.5 py-1 rounded-lg bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 text-xs font-semibold transition">
+                    ${currentLang === 'fa' ? 'کپی لینک' : 'Copy'}
+                  </button>
+                  <button onclick="openClientQr('${c.id}')" class="px-2.5 py-1 rounded-lg bg-white/[0.05] hover:bg-white/[0.1] text-slate-300 text-xs font-semibold transition">
+                    QR
+                  </button>
+                  <button onclick="resetClientTraffic('${c.email}')" class="px-2 py-1 rounded-lg bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 text-xs transition" title="${currentLang === 'fa' ? 'صفر کردن ترافیک' : 'Reset'}">
+                    🔄
+                  </button>
+                  <button onclick="deleteClient('${c.id}', '${c.email}')" class="px-2 py-1 rounded-lg bg-rose-950/40 hover:bg-rose-900/60 text-rose-300 text-xs transition" title="${currentLang === 'fa' ? 'حذف کاربر' : 'Delete'}">
+                    🗑️
+                  </button>
+                </div>
+              </div>
+            </div>
+          `;
+        }).join('');
+      }
+
+      // 2. Render Desktop Table View
+      if (tbody) {
+        tbody.innerHTML = list.map(c => {
+          const isOnline = c.is_online;
+          const onlineDot = isOnline
+            ? `<span class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-[10px] font-bold"><span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>${currentLang === 'fa' ? 'آنلاین' : 'Online'}</span>`
+            : (c.last_seen_fa && c.last_seen_fa !== 'تاکنون متصل نشده'
+              ? `<span class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-amber-500/10 text-amber-300 border border-amber-500/20 text-[10px] font-medium">${currentLang === 'fa' ? c.last_seen_fa : c.last_seen_en}</span>`
+              : `<span class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-white/[0.04] text-slate-400 border border-white/[0.06] text-[10px]">${currentLang === 'fa' ? 'آماده اتصال' : 'Ready'}</span>`);
+
+          const bw = (c.bandwidth_limit_mbps !== undefined && c.bandwidth_limit_mbps !== null) ? c.bandwidth_limit_mbps : 10;
+          const displayName = c.name || c.email;
+
+          return `
+            <tr class="hover:bg-white/[0.02] transition">
+              <td class="p-3.5 text-start">
+                <div class="font-bold text-white text-xs select-all">${displayName}</div>
+                <div class="text-[11px] text-slate-400 font-mono mt-0.5 select-all">${c.email}</div>
+                <div class="text-[10px] text-slate-400 font-mono mt-1.5 flex items-center gap-2 flex-wrap">
+                  <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-indigo-500/15 text-indigo-300 border border-indigo-500/30 text-[10px] font-semibold">
+                    <span class="text-slate-400 font-normal">${i18nAdmin[currentLang].connectedIpLabel}</span>
+                    <span class="font-mono font-bold select-all text-white">${c.last_ip && c.last_ip !== '---' ? c.last_ip : i18nAdmin[currentLang].notRecorded}</span>
+                  </span>
+                  <span class="text-slate-500">•</span>
+                  <span class="text-slate-400 text-[10px]">${currentLang === 'fa' ? (c.last_seen_fa || 'تاکنون متصل نشده') : (c.last_seen_en || 'Never connected')}</span>
+                </div>
+              </td>
+              <td class="p-3.5 text-center">
+                <div>${onlineDot}</div>
+              </td>
+              <td class="p-3.5 text-start">
+                <div class="font-bold text-slate-200 text-xs">${c.total_used_str || '0 B'}</div>
+                <div class="text-[10px] text-slate-500 font-mono">↑ ${c.up_str || '0 B'} | ↓ ${c.down_str || '0 B'}</div>
+              </td>
+              <td class="p-3.5 text-center">
+                <select onchange="updateClientBandwidth('${c.email}', this.value)" class="px-2.5 py-1 rounded-lg bg-slate-950 border border-white/[0.1] text-xs font-semibold text-indigo-300 focus:outline-none focus:border-indigo-500 cursor-pointer">
+                  <option value="5" ${bw === 5 ? 'selected' : ''}>5 Mbps</option>
+                  <option value="10" ${bw === 10 ? 'selected' : ''}>10 Mbps (Default)</option>
+                  <option value="20" ${bw === 20 ? 'selected' : ''}>20 Mbps</option>
+                  <option value="25" ${bw === 25 ? 'selected' : ''}>25 Mbps</option>
+                  <option value="50" ${bw === 50 ? 'selected' : ''}>50 Mbps</option>
+                  <option value="0" ${bw === 0 ? 'selected' : ''}>${i18nAdmin[currentLang].unlimited}</option>
+                </select>
+              </td>
+              <td class="p-3.5 text-center">
+                <div class="inline-flex items-center gap-1.5 justify-center">
+                  <button onclick="openClientQr('${c.id}')" class="px-2 py-1 rounded-lg bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/30 text-[11px] font-semibold transition">QR</button>
+                  <button onclick="copyClientSub('${c.smart_sub_link}')" class="px-2 py-1 rounded-lg bg-white/[0.05] hover:bg-white/[0.1] text-slate-300 border border-white/[0.08] text-[11px] font-semibold transition">Copy</button>
+                  <button onclick="resetClientTraffic('${c.email}')" class="px-2 py-1 rounded-lg bg-white/[0.05] hover:bg-white/[0.1] text-cyan-300 border border-white/[0.08] text-[11px] font-semibold transition">Reset</button>
+                  <button onclick="deleteClient('${c.id}', '${c.email}')" class="px-2 py-1 rounded-lg bg-rose-950/40 hover:bg-rose-900/60 text-rose-300 border border-rose-800/80 text-[11px] font-semibold transition">Delete</button>
+                </div>
+              </td>
+            </tr>
+          `;
+        }).join('');
+      }
     }
 
     async function updateClientBandwidth(email, val) {
