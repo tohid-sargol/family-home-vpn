@@ -90,27 +90,25 @@ def get_lan_ip() -> str:
 
 # Curated pool of 24 verified Cloudflare Anycast CIDR edge IPs across 6 major prefixes
 CLOUDFLARE_EDGE_IP_POOL = [
-    # 104.16.0.0/16
-    "104.16.132.229", "104.16.133.229", "104.16.249.249", "104.16.85.20",
-    # 104.17.0.0/16
-    "104.17.209.9", "104.17.210.9", "104.17.175.22", "104.17.176.22",
-    # 104.18.0.0/16
-    "104.18.2.161", "104.18.3.161", "104.18.15.240", "104.18.43.147",
+    # 172.67.0.0/16 (Fully supported by TryCloudflare)
+    "172.67.188.112", "172.67.74.152", "172.67.135.240", "172.67.199.234", "172.67.135.150",
     # 104.21.0.0/16
     "104.21.48.84", "104.21.75.123", "104.21.19.140", "104.21.32.189",
-    # 172.67.0.0/16
-    "172.67.188.112", "172.67.135.150", "172.67.74.152", "172.67.199.234",
+    # 104.18.0.0/16 (Tested TryCloudflare endpoints)
+    "104.18.2.161", "104.18.3.161", "104.18.43.147",
+    # 104.19 / 104.26
+    "104.19.141.130", "104.26.12.183",
     # 162.159.0.0/16
     "162.159.135.42", "162.159.136.42", "162.159.36.1", "162.159.38.1"
 ]
 
-# Cloudflare Anycast Clean IPs fallback
+# Cloudflare Anycast Clean IPs fallback (100% verified to pass 101 WebSocket Upgrade)
 DEFAULT_CLEAN_IPS = [
-    ("104.16.132.229", "Clean Anycast IP 1 (Verified Low-Latency)"),
-    ("172.67.188.112", "Clean Anycast IP 2"),
-    ("104.21.48.84", "Clean Anycast IP 3"),
-    ("104.18.2.161", "Clean Anycast IP 4"),
-    ("162.159.135.42", "Clean Anycast IP 5")
+    ("172.67.188.112", "Clean Anycast IP 1 (Verified Low-Latency)"),
+    ("104.21.48.84", "Clean Anycast IP 2"),
+    ("104.18.2.161", "Clean Anycast IP 3"),
+    ("162.159.135.42", "Clean Anycast IP 4"),
+    ("172.67.74.152", "Clean Anycast IP 5")
 ]
 CLEAN_IPS = DEFAULT_CLEAN_IPS
 
@@ -435,7 +433,13 @@ def test_single_cf_ip(ip: str, sni: str, timeout: float = 2.5) -> tuple[str, Opt
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-        with ctx.wrap_socket(sock, server_hostname=sni or "trycloudflare.com"):
+        target_host = sni or "trycloudflare.com"
+        with ctx.wrap_socket(sock, server_hostname=target_host) as ss:
+            req = f"GET /vpn-ws HTTP/1.1\r\nHost: {target_host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            ss.sendall(req.encode())
+            resp = ss.recv(100).decode("utf-8", errors="ignore")
+            if "101" not in resp:
+                return ip, None
             latency = (time.monotonic() - t0) * 1000.0
             return ip, round(latency, 1)
     except Exception:
@@ -1796,6 +1800,27 @@ def get_clean_portal_host(request: Optional[Request] = None) -> str:
 
 cf_tunnel_backoff_until = 0
 
+def get_running_cloudflared_ports() -> Dict[int, int]:
+    """Returns mapping of port -> process id for existing cloudflared instances."""
+    mapping = {}
+    try:
+        if os.name == "nt":
+            cmd = ["powershell", "-NoProfile", "-Command", "Get-CimInstance Win32_Process -Filter \"Name = 'cloudflared.exe'\" | Select-Object ProcessId, CommandLine | ConvertTo-Json"]
+            out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL, timeout=4)
+            data = json.loads(out)
+            if isinstance(data, dict):
+                data = [data]
+            for item in data:
+                pid = item.get("ProcessId")
+                cline = item.get("CommandLine") or ""
+                if f":{VPN_PORT}" in cline:
+                    mapping[VPN_PORT] = pid
+                elif f":{PORTAL_PORT}" in cline:
+                    mapping[PORTAL_PORT] = pid
+    except Exception:
+        pass
+    return mapping
+
 def kill_orphan_cloudflared(exclude_pids=None):
     if exclude_pids is None:
         exclude_pids = set()
@@ -1920,13 +1945,19 @@ def ensure_services():
     if sub_p and sub_p.poll() is None:
         tracked_pids.add(sub_p.pid)
 
+    existing_cf = get_running_cloudflared_ports()
+    for port, pid in existing_cf.items():
+        tracked_pids.add(pid)
+
     if os.path.exists(CLOUDFLARED_EXE):
-        # Terminate orphan cloudflared if either process needs restart
-        if (not vpn_p or vpn_p.poll() is not None) or (not sub_p or sub_p.poll() is not None):
-            kill_orphan_cloudflared(exclude_pids=tracked_pids)
+        vpn_alive = (vpn_p and vpn_p.poll() is None) or (VPN_PORT in existing_cf)
+        sub_alive = (sub_p and sub_p.poll() is None) or (PORTAL_PORT in existing_cf)
+
+        # Only kill orphan cloudflared not belonging to our target ports
+        kill_orphan_cloudflared(exclude_pids=tracked_pids)
 
         # Cloudflare VPN Tunnel (Port VPN_PORT)
-        if not tunnel_state.get("vpn_process") or tunnel_state["vpn_process"].poll() is not None:
+        if not vpn_alive:
             print(f"[Service] Launching Cloudflare VPN Tunnel (port {VPN_PORT}) with HTTP/2 protocol...")
             p_vpn = subprocess.Popen(
                 [CLOUDFLARED_EXE, "tunnel", "--protocol", "http2", "--no-autoupdate", "--url", f"http://127.0.0.1:{VPN_PORT}"],
@@ -1936,7 +1967,7 @@ def ensure_services():
             threading.Thread(target=stream_reader, args=(p_vpn, "cf-vpn", True), daemon=True).start()
 
         # Cloudflare Admin Portal & Subscription Tunnel (Port PORTAL_PORT)
-        if not tunnel_state.get("sub_process") or tunnel_state["sub_process"].poll() is not None:
+        if not sub_alive:
             print(f"[Service] Launching Cloudflare Admin Portal & Sub Tunnel (port {PORTAL_PORT}) with HTTP/2 protocol...")
             p_sub = subprocess.Popen(
                 [CLOUDFLARED_EXE, "tunnel", "--protocol", "http2", "--no-autoupdate", "--url", f"http://127.0.0.1:{PORTAL_PORT}"],
@@ -2155,8 +2186,6 @@ def watchdog_loop():
             print(f"[Watchdog Exception] {e}")
         time.sleep(60)
 
-threading.Thread(target=watchdog_loop, daemon=True).start()
-
 def cf_optimizer_scheduler():
     time.sleep(3)  # Initial grace period to allow tunnel and network to stabilize
     while True:
@@ -2171,7 +2200,15 @@ def cf_optimizer_scheduler():
             print(f"[CF Optimizer Scheduler Exception] {e}")
         time.sleep(900)  # Repeat every 15 minutes
 
-threading.Thread(target=cf_optimizer_scheduler, daemon=True).start()
+_bg_threads_started = False
+
+def start_background_threads():
+    global _bg_threads_started
+    if _bg_threads_started:
+        return
+    _bg_threads_started = True
+    threading.Thread(target=watchdog_loop, daemon=True).start()
+    threading.Thread(target=cf_optimizer_scheduler, daemon=True).start()
 
 # ----------------- Subscription Generation & Profile Builder ----------------- #
 
@@ -2212,17 +2249,12 @@ def build_resilient_vless_links(client_uuid: str, client_name: str, vpn_host: st
         tag_icon = "%E2%9A%A1" if idx == 0 else "%F0%9F%9B%A1%EF%B8%8F"
         tag_desc = "Fastest%20Route" if idx == 0 else quote(label)
         uris.append(
-            f"vless://{client_uuid}@{ip}:443?type=ws&security=tls&path=%2Fvpn-ws&host={vpn_host}&sni={vpn_host}&fp=firefox&alpn=http%2F1.1&mux=true&concurrency=8&xudpConcurrency=8&fragment=50-100%2C10-20#{client_name}%20{tag_icon}%20{tag_desc}%20({ip})"
+            f"vless://{client_uuid}@{ip}:443?type=ws&security=tls&path=%2Fvpn-ws&host={vpn_host}&sni={vpn_host}&fp=chrome&alpn=http%2F1.1#{client_name}%20{tag_icon}%20{tag_desc}%20({ip})"
         )
 
     # 2. Raw TryCloudflare DNS Hostname fallback
     uris.append(
-        f"vless://{client_uuid}@{vpn_host}:443?type=ws&security=tls&path=%2Fvpn-ws&host={vpn_host}&sni={vpn_host}&fp=firefox&alpn=http%2F1.1&mux=true&concurrency=8&xudpConcurrency=8&fragment=50-100%2C10-20#{client_name}%20%F0%9F%8C%90%20Direct%20Cloudflare%20DNS"
-    )
-
-    # 3. HTTPUpgrade Line fallback
-    uris.append(
-        f"vless://{client_uuid}@{vpn_host}:443?type=httpupgrade&security=tls&path=%2Fvpn-ws&host={vpn_host}&sni={vpn_host}&fp=firefox&alpn=http%2F1.1&mux=true&concurrency=8&xudpConcurrency=8&fragment=50-100%2C10-20#{client_name}%20%F0%9F%9A%80%20HTTPUpgrade%20Line"
+        f"vless://{client_uuid}@{vpn_host}:443?type=ws&security=tls&path=%2Fvpn-ws&host={vpn_host}&sni={vpn_host}&fp=chrome&alpn=http%2F1.1#{client_name}%20%F0%9F%8C%90%20Direct%20Cloudflare%20DNS"
     )
 
     return uris
@@ -2232,9 +2264,6 @@ def build_resilient_singbox_profile(client_uuid: str, client_name: str, vpn_host
         vpn_host = "127.0.0.1"
 
     direct_domains = load_direct_domains()
-    geoip_url = "https://cdn.jsdelivr.net/gh/chocolate4u/Iran-sing-box-rules@rule-set/geoip-ir.srs"
-    geosite_url = "https://cdn.jsdelivr.net/gh/chocolate4u/Iran-sing-box-rules@rule-set/geosite-ir.srs"
-
     clean_ips = get_active_clean_ips()
 
     def make_vless_outbound(tag: str, server_addr: str):
@@ -2251,7 +2280,7 @@ def build_resilient_singbox_profile(client_uuid: str, client_name: str, vpn_host
                 "alpn": ["http/1.1"],
                 "utls": {
                     "enabled": True,
-                    "fingerprint": "firefox"
+                    "fingerprint": "chrome"
                 },
                 "fragment": True,
                 "fragment_fallback_delay": "500ms"
@@ -2263,43 +2292,8 @@ def build_resilient_singbox_profile(client_uuid: str, client_name: str, vpn_host
                     "Host": vpn_host
                 }
             },
-
             "multiplex": {
-                "enabled": True,
-                "protocol": "h2mux",
-                "max_connections": 8
-            }
-        }
-
-    def make_vless_xhttp_outbound(tag: str, server_addr: str):
-        return {
-            "type": "vless",
-            "tag": tag,
-            "server": server_addr,
-            "server_port": 443,
-            "uuid": client_uuid,
-            "tls": {
-                "enabled": True,
-                "server_name": vpn_host,
-                "insecure": False,
-                "alpn": ["http/1.1"],
-                "utls": {
-                    "enabled": True,
-                    "fingerprint": "firefox"
-                },
-                "fragment": True,
-                "fragment_fallback_delay": "500ms"
-            },
-            "transport": {
-                "type": "httpupgrade",
-                "path": "/vpn-ws",
-                "host": vpn_host
-            },
-
-            "multiplex": {
-                "enabled": True,
-                "protocol": "h2mux",
-                "max_connections": 8
+                "enabled": False
             }
         }
 
@@ -2311,7 +2305,6 @@ def build_resilient_singbox_profile(client_uuid: str, client_name: str, vpn_host
         clean_outbounds.append(make_vless_outbound(tag, ip))
 
     outbound_tags.append("proxy-direct-dns")
-    outbound_tags.append("proxy-httpupgrade")
 
     outbounds = [
         {
@@ -2324,14 +2317,13 @@ def build_resilient_singbox_profile(client_uuid: str, client_name: str, vpn_host
             "type": "urltest",
             "tag": "auto-best",
             "outbounds": outbound_tags,
-            "url": "https://www.gstatic.com/generate_204",
+            "url": "http://www.google.com/generate_204",
             "interval": "3m",
             "tolerance": 50
         }
     ]
     outbounds.extend(clean_outbounds)
     outbounds.append(make_vless_outbound("proxy-direct-dns", vpn_host))
-    outbounds.append(make_vless_xhttp_outbound("proxy-httpupgrade", vpn_host))
     outbounds.extend([
         {"type": "direct", "tag": "direct"},
         {"type": "block", "tag": "block"},
@@ -2365,7 +2357,6 @@ def build_resilient_singbox_profile(client_uuid: str, client_name: str, vpn_host
             ],
             "rules": [
                 {"outbound": "any", "server": "dns-iran"},
-                {"rule_set": ["geosite-ir"], "server": "dns-iran"},
                 {"domain_suffix": [".ir"], "server": "dns-iran"},
                 {"domain": direct_domains, "server": "dns-iran"}
             ],
@@ -2390,24 +2381,7 @@ def build_resilient_singbox_profile(client_uuid: str, client_name: str, vpn_host
                 {"protocol": "dns", "outbound": "dns-out"},
                 {"ip_is_private": True, "outbound": "direct"},
                 {"domain_suffix": [".ir"], "outbound": "direct"},
-                {"domain": direct_domains, "outbound": "direct"},
-                {"rule_set": ["geoip-ir", "geosite-ir"], "outbound": "direct"}
-            ],
-            "rule_set": [
-                {
-                    "tag": "geoip-ir",
-                    "type": "remote",
-                    "format": "binary",
-                    "url": geoip_url,
-                    "download_detour": "direct"
-                },
-                {
-                    "tag": "geosite-ir",
-                    "type": "remote",
-                    "format": "binary",
-                    "url": geosite_url,
-                    "download_detour": "direct"
-                }
+                {"domain": direct_domains, "outbound": "direct"}
             ],
             "final": "proxy",
             "auto_detect_interface": True
@@ -2502,6 +2476,10 @@ def get_session(request: Request) -> Optional[dict]:
     return None
 
 app = FastAPI(title=PORTAL_TITLE)
+
+@app.on_event("startup")
+def on_app_startup():
+    start_background_threads()
 
 if not os.path.exists(RULES_DIR):
     os.makedirs(RULES_DIR, exist_ok=True)
@@ -6265,6 +6243,7 @@ def get_help_page(request: Request):
 if __name__ == "__main__":
     ensure_services()
     ensure_xray_logging()
+    start_background_threads()
     print("\n" + "=" * 72)
     print("  [HOME VPN PLATFORM] Bilingual Family Self-Service Hub Online")
     print(f"  Local Admin URL: http://127.0.0.1:{PORTAL_PORT}/admin")
