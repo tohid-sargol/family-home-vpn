@@ -1933,6 +1933,7 @@ def stream_reader(proc, name, is_vpn=True):
             if m:
                 host = m.group(1)
                 url = f"https://{host}"
+                tunnel_created_time[name] = time.time()
                 if is_vpn:
                     old_host = tunnel_state.get("vpn_host")
                     tunnel_state["vpn_url"] = url
@@ -2264,9 +2265,65 @@ def check_user_quotas_for_alerts():
     except Exception as e:
         print(f"[Quota Check Error] {e}")
 
+tunnel_created_time = {}
+
+def verify_and_heal_expired_tunnels():
+    """Actively verifies if TryCloudflare tunnel domains are resolving in DNS. If expired/dead, terminates stale processes to trigger immediate recreation."""
+    now = time.time()
+    if now < cf_tunnel_backoff_until:
+        return
+
+    # 1. Check portal tunnel DNS (with 60s initial grace period for propagation)
+    portal_host = tunnel_state.get("portal_host")
+    sub_created = tunnel_created_time.get("cf-sub", 0)
+    if (now - sub_created > 60) and portal_host and "trycloudflare.com" in portal_host and portal_host not in ("Pending...", "Unknown"):
+        try:
+            socket.getaddrinfo(portal_host, 443, proto=socket.IPPROTO_TCP)
+        except Exception as e_dns:
+            print(f"[Watchdog Health] Portal tunnel {portal_host} has expired in DNS ({e_dns}). Restarting sub tunnel...")
+            p_sub = tunnel_state.get("sub_process")
+            if p_sub and p_sub.poll() is None:
+                try:
+                    p_sub.kill()
+                except Exception:
+                    pass
+            existing_cf = get_running_cloudflared_ports()
+            if PORTAL_PORT in existing_cf:
+                try:
+                    subprocess.run(["taskkill", "/f", "/pid", str(existing_cf[PORTAL_PORT])], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except Exception:
+                    pass
+            tunnel_state.pop("sub_process", None)
+            tunnel_state.pop("portal_host", None)
+            tunnel_state.pop("sub_host", None)
+
+    # 2. Check VPN tunnel DNS (with 60s initial grace period for propagation)
+    vpn_host = tunnel_state.get("vpn_host")
+    vpn_created = tunnel_created_time.get("cf-vpn", 0)
+    if (now - vpn_created > 60) and vpn_host and "trycloudflare.com" in vpn_host and vpn_host not in ("Pending...", "Unknown"):
+        try:
+            socket.getaddrinfo(vpn_host, 443, proto=socket.IPPROTO_TCP)
+        except Exception as e_dns:
+            print(f"[Watchdog Health] VPN tunnel {vpn_host} has expired in DNS ({e_dns}). Restarting VPN tunnel...")
+            p_vpn = tunnel_state.get("vpn_process")
+            if p_vpn and p_vpn.poll() is None:
+                try:
+                    p_vpn.kill()
+                except Exception:
+                    pass
+            existing_cf = get_running_cloudflared_ports()
+            if VPN_PORT in existing_cf:
+                try:
+                    subprocess.run(["taskkill", "/f", "/pid", str(existing_cf[VPN_PORT])], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except Exception:
+                    pass
+            tunnel_state.pop("vpn_process", None)
+            tunnel_state.pop("vpn_host", None)
+
 def watchdog_loop():
     while True:
         try:
+            verify_and_heal_expired_tunnels()
             ensure_services()
             sync_3xui_with_tunnels()
             ensure_xray_logging()
