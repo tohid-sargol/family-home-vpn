@@ -17,6 +17,8 @@ import uuid
 import base64
 import socket
 import ssl
+import http.client
+import urllib.request
 import concurrent.futures
 import sqlite3
 import datetime
@@ -978,16 +980,20 @@ def provision_telegram_new_user(name: str) -> tuple[bool, str, Optional[dict]]:
 
     pwd = secrets.token_urlsafe(12)
     invite = get_invite_code()
-    return register_family_member(name_clean, slug, pwd, invite)
+    res = register_family_member(name_clean, slug, pwd, invite)
+    if res[0]:
+        trigger_github_pages_sync(force=True)
+    return res
 
 def trigger_github_pages_sync(portal_url: str = "", force: bool = False):
-    """Asynchronously triggers GitHub Pages static redirector sync without blocking web requests."""
+    """Asynchronously triggers GitHub Pages permanent subscription & redirector sync without blocking web requests."""
     def _run():
         try:
             from github_pages_sync import sync_github_pages
             p_url = portal_url or tunnel_state.get("portal_url") or ""
+            v_host = tunnel_state.get("vpn_host") or ""
             if p_url and "trycloudflare.com" in p_url:
-                sync_github_pages(active_portal_url=p_url, force=force)
+                sync_github_pages(active_portal_url=p_url, active_vpn_host=v_host, force=force)
         except Exception as e:
             print(f"[GH-Pages Background Sync Error] {e}")
     threading.Thread(target=_run, daemon=True).start()
@@ -1010,14 +1016,16 @@ def handle_telegram_command(token: str, chat_id: str, text: str):
 
     if cmd in ("/start", "/help", "راهنما", "شروع"):
         reply = (
-            "👋 <b>سلام آقا توحید! به ربات مدیریت فیلترشکن خانواده خوش آمدید.</b>\n\n"
-            "⚙️ <b>دستورات مدیریتی ربات:</b>\n\n"
-            "➕ <code>/newuser &lt;نام&gt;</code> - ساخت کاربر جدید و دریافت لینک اشتراک دائمی فوری\n"
-            "🔗 /admin یا /link - دریافت لینک جدید پنل ادمین و اطلاعات ورود\n"
-            "📊 /status - بررسی وضعیت آنلاین پورتال، تونل VLESS و آی‌پی تمیز\n"
-            "👥 /users - مشاهده وضعیت و ترافیک مصرفی تک‌تک اعضای خانواده\n"
-            "⚡ /scan - اسکن ۲۴ آی‌پی Anycast کلودفلر و انتخاب کمترین تاخیر\n\n"
-            f"🌐 <b>لینک دائمی پورتال:</b>\n<code>{GH_PAGES_BASE_URL}</code>"
+            "👋 <b>سلام آقا توحید! به ربات مدیریت هوشمند فیلترشکن خانواده خوش آمدید.</b>\n\n"
+            "⚙️ <b>دستورات کنترلی و مانیتورینگ ربات:</b>\n\n"
+            "➕ <code>/newuser &lt;نام&gt;</code> - ساخت کاربر جدید و دریافت فوری لینک دائمی\n"
+            "🧪 <code>/test</code> یا <code>/check</code> - تست زنده تونل‌ها و بررسی قطعی احتمالی\n"
+            "🔄 <code>/heal</code> یا <code>/restart</code> - راه‌اندازی مجدد تونل‌ها و سینک گیت‌هاب\n"
+            "📊 /status - بررسی گزارش لحظه‌ای پورتال، تونل VLESS و مصرف\n"
+            "👥 /users - وضعیت آنلاین بودن و مصرف تک‌تک اعضا\n"
+            "🔗 /admin یا /link - دریافت مشخصات و لینک ورود به پنل ادمین\n"
+            "⚡ /scan - اسکن بهترین آی‌پی تمیز Anycast کلودفلر\n\n"
+            f"🌐 <b>آدرس دائمی پورتال:</b>\n<code>{GH_PAGES_BASE_URL}</code>"
         )
     elif cmd.startswith("/newuser") or cmd.startswith("کاربر جدید"):
         raw_parts = (text or "").strip().split(maxsplit=1)
@@ -1035,7 +1043,9 @@ def handle_telegram_command(token: str, chat_id: str, text: str):
                 reply = f"❌ <b>خطا در ایجاد کاربر:</b>\n{msg}"
             else:
                 sub_token = u_obj.get("sub_id", "")
-                perm_sub_link = f"{GH_PAGES_BASE_URL}?sub={sub_token}"
+                perm_sub_json = f"{GH_PAGES_BASE_URL}/sub/{sub_token}.json"
+                perm_user_page = f"{GH_PAGES_BASE_URL}/user/{sub_token}/"
+                perm_sub_vless = f"{GH_PAGES_BASE_URL}/sub/{sub_token}.txt"
                 direct_sub_link = f"https://{portal_host}/sub/{sub_token}"
 
                 reply = (
@@ -1043,19 +1053,60 @@ def handle_telegram_command(token: str, chat_id: str, text: str):
                     "───────────────────\n"
                     "این پیام را می‌توانید مستقیماً برای ایشان فوروارد کنید:\n\n"
                     f"👋 <b>سلام {user_name} عزیز!</b>\n"
-                    "لینک اختصاصی اتصال شما به اینترنت پرسرعت و بدون محدودیت:\n\n"
-                    f"🔗 <b>لینک اشتراک دائمی (Permanent Link):</b>\n"
-                    f"<code>{perm_sub_link}</code>\n\n"
-                    f"🌐 <b>لینک مستقیم پشتیبان (Direct Backup):</b>\n"
-                    f"<code>{direct_sub_link}</code>\n\n"
+                    "لینک اختصاصی و دائمی اتصال شما به اینترنت پرسرعت:\n\n"
+                    f"🚀 <b>لینک سابسکریپشن دائمی هیدیفای (Permanent JSON):</b>\n"
+                    f"<code>{perm_sub_json}</code>\n\n"
+                    f"📱 <b>صفحه اختصاصی تحت وب و اتصال ۱ کلیک:</b>\n"
+                    f"<code>{perm_user_page}</code>\n\n"
+                    f"📋 <b>لینک سابسکریپشن VLESS (برای v2rayNG):</b>\n"
+                    f"<code>{perm_sub_vless}</code>\n\n"
                     "📱 <b>راهنمای اتصال سریع:</b>\n"
-                    "۱. برنامه <b>Hiddify</b> (پیشنهادی) یا <b>v2rayNG</b> را باز کنید.\n"
-                    "۲. لینک بالا را کپی کرده و در برنامه گزینه <b>«+»</b> (افزودن از کلیپ‌بورد) را لمس کنید.\n"
-                    "۳. دکمه دایره‌ای اتصال را بزنید.\n\n"
-                    "⚡ <i>مجهز به دور زدن خودکار سایت‌ها و اپ‌های ایرانی (بانک‌ها، اسنپ، دیجی‌کالا و ...)</i>\n"
+                    "۱. لینک دائمی هیدیفای بالا را کپی کنید.\n"
+                    "۲. برنامه <b>Hiddify</b> را باز کرده و دکمه <b>«+»</b> را بزنید.\n"
+                    "۳. دکمه دایره‌ای اتصال را لمس کنید.\n\n"
+                    "⚡ <i>مجهز به ۵ مسیر پاک ضد اختلال و دور زدن خودکار سایت‌ها و بانک‌های ایرانی</i>\n"
                     "───────────────────\n"
                     "✅ <i>سقف سرعت: ۱۰ مگابیت بر ثانیه | حجم ترافیک: نامحدود</i>"
                 )
+    elif cmd in ("/test", "/check", "تست", "چک"):
+        p_ok = check_portal_tunnel_alive(portal_host)
+        v_ok = check_vpn_tunnel_alive(vpn_host)
+        gh_ok = False
+        try:
+            req_gh = urllib.request.Request(f"{GH_PAGES_BASE_URL}/.nojekyll", headers={"User-Agent": "Watchdog/1.0"})
+            with urllib.request.urlopen(req_gh, timeout=4.0) as r_gh:
+                gh_ok = (r_gh.status == 200)
+        except Exception:
+            pass
+
+        p_str = "🟢 متصل و آنلاین (HTTP 200)" if p_ok else "🔴 عدم پاسخگویی یا منقضی شده"
+        v_str = "🟢 فعال و برقرار (WebSocket 101)" if v_ok else "🔴 عدم پاسخگویی یا قطع"
+        gh_str = "🟢 آنلاین و سینک شده (HTTP 200)" if gh_ok else "🔴 عدم دسترسی"
+
+        reply = (
+            "🧪 <b>گزارش تست زنده و بررسی سلامت سرویس‌ها:</b>\n\n"
+            f"🛡️ <b>تونل سرور وی‌پی‌ان:</b> {v_str}\n"
+            f"<code>{vpn_host}</code>\n\n"
+            f"🌐 <b>تونل پورتال مدیریت:</b> {p_str}\n"
+            f"<code>https://{portal_host}</code>\n\n"
+            f"🐙 <b>هاست دائمی گیت‌هاب پیج:</b> {gh_str}\n"
+            f"<code>{GH_PAGES_BASE_URL}</code>\n\n"
+            f"⚡ <b>سریع‌ترین آی‌پی کلودفلر:</b> <code>{best_ip}</code> ({lat} ms)\n\n"
+            "🩺 <i>واچ‌داگ هوشمند هر ۶۰ ثانیه این تست را خودکار انجام داده و در صورت بروز قطعی، بلافاصله سیستم خوددرمانی را فعال و به شما پیام می‌دهد.</i>"
+        )
+    elif cmd in ("/heal", "/restart", "ریستارت", "تعمیر"):
+        send_telegram_alert_async("⏳ <b>در حال فعال‌سازی فرآیند خوددرمانی و راه‌اندازی مجدد تونل‌ها...</b>\nلطفاً چند ثانیه صبور باشید.")
+        # Terminate cloudflared
+        existing_cf = get_running_cloudflared_ports()
+        for p, pid in existing_cf.items():
+            try:
+                subprocess.run(["taskkill", "/f", "/pid", str(pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+        tunnel_state.pop("vpn_process", None)
+        tunnel_state.pop("sub_process", None)
+        ensure_services()
+        reply = "🛠️ <b>فرآیند خوددرمانی آغاز شد.</b> به محض دریافت دامنه‌های جدید و سینک گیت‌هاب، اعلان موفقیت ارسال خواهد شد."
     elif cmd in ("/admin", "/link", "لینک", "ادمین", "پنل"):
         reply = (
             "🔐 <b>مشخصات و لینک ورود به پنل مدیریت (ادمین):</b>\n\n"
@@ -1107,9 +1158,8 @@ def handle_telegram_command(token: str, chat_id: str, text: str):
                 down = c.get("down_str", "0 B")
                 bw = c.get("bandwidth_limit_mbps", 10)
                 bw_str = f"{bw} Mbps" if bw > 0 else "نامحدود"
-                sub = c.get("json_sub_link", "")
                 sub_id = c.get("subId", "")
-                perm_link = f"{GH_PAGES_BASE_URL}?sub={sub_id}" if sub_id else ""
+                perm_link = f"{GH_PAGES_BASE_URL}/sub/{sub_id}.json" if sub_id else ""
 
                 lines.append(
                     f"{idx}. <b>{name}</b>\n"
@@ -1117,8 +1167,7 @@ def handle_telegram_command(token: str, chat_id: str, text: str):
                     f"   • آخرین آی‌پی: <code>{ip}</code>\n"
                     f"   • مصرف ترافیک: <b>{used}</b> (↑ {up} | ↓ {down})\n"
                     f"   • سقف سرعت: {bw_str}\n"
-                    f"   • لینک دائمی: <code>{perm_link}</code>\n"
-                    f"   • لینک مستقیم: <code>{sub}</code>\n"
+                    f"   • لینک دائمی هیدیفای: <code>{perm_link}</code>\n"
                 )
             reply = "\n".join(lines)
     elif cmd in ("/scan", "اسکن", "بهینه‌سازی"):
@@ -1941,7 +1990,12 @@ def stream_reader(proc, name, is_vpn=True):
                     tunnel_state.pop("vpn_error", None)
                     print(f"[TUNNEL] VPN Tunnel Active: {url}")
                     if old_host and old_host != host:
-                        send_telegram_alert_async(f"🚨 <b>Home VPN Tunnel Updated!</b>\nNew VPN Server: <code>{host}</code>\nSubscription links auto-updated.")
+                        send_telegram_alert_async(
+                            "✅ <b>تونل سرور وی‌پی‌ان با موفقیت به‌روزرسانی شد!</b>\n\n"
+                            f"🌐 <b>آدرس سرور جدید:</b> <code>{host}</code>\n"
+                            "🔄 تمام لینک‌های دائمی گیت‌هاب پیج اعضای خانواده خودبه‌خود با این آدرس سینک شدند."
+                        )
+                    trigger_github_pages_sync(force=True)
                 else:
                     old_sub = tunnel_state.get("portal_host")
                     tunnel_state["sub_url"] = url
@@ -1951,7 +2005,7 @@ def stream_reader(proc, name, is_vpn=True):
                     tunnel_state.pop("sub_error", None)
                     print(f"[TUNNEL] Admin Portal & Sub Tunnel Active: {url}")
                     send_admin_portal_startup_alert(url)
-                    trigger_github_pages_sync(url)
+                    trigger_github_pages_sync(url, force=True)
 
                 tunnel_state["last_sync"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 sync_3xui_with_tunnels()
@@ -2266,59 +2320,108 @@ def check_user_quotas_for_alerts():
         print(f"[Quota Check Error] {e}")
 
 tunnel_created_time = {}
+tunnel_consecutive_failures = 0
+last_disconnect_alert_sent = 0
+
+def check_portal_tunnel_alive(host: str) -> bool:
+    if not host or "trycloudflare.com" not in host or host in ("Pending...", "Unknown"):
+        return False
+    try:
+        url = f"https://{host}/api/status"
+        ctx = ssl.create_default_context()
+        req = urllib.request.Request(url, headers={"User-Agent": "Watchdog/1.0"})
+        with urllib.request.urlopen(req, context=ctx, timeout=5.0) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+def check_vpn_tunnel_alive(host: str) -> bool:
+    if not host or "trycloudflare.com" not in host or host in ("Pending...", "Unknown"):
+        return False
+    try:
+        import http.client
+        ctx = ssl.create_default_context()
+        conn = http.client.HTTPSConnection(host, 443, context=ctx, timeout=5.0)
+        headers = {
+            "Host": host,
+            "Upgrade": "websocket",
+            "Connection": "Upgrade",
+            "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==",
+            "Sec-WebSocket-Version": "13"
+        }
+        conn.request("GET", "/vpn-ws", headers=headers)
+        resp = conn.getresponse()
+        status = resp.status
+        conn.close()
+        return status == 101
+    except Exception:
+        return False
 
 def verify_and_heal_expired_tunnels():
-    """Actively verifies if TryCloudflare tunnel domains are resolving in DNS. If expired/dead, terminates stale processes to trigger immediate recreation."""
+    """Actively probes live HTTP and WebSocket status of TryCloudflare tunnels. If expired/dead, sends Telegram alert and triggers self-healing."""
+    global tunnel_consecutive_failures, last_disconnect_alert_sent
     now = time.time()
     if now < cf_tunnel_backoff_until:
         return
 
-    # 1. Check portal tunnel DNS (with 60s initial grace period for propagation)
     portal_host = tunnel_state.get("portal_host")
+    vpn_host = tunnel_state.get("vpn_host")
     sub_created = tunnel_created_time.get("cf-sub", 0)
-    if (now - sub_created > 60) and portal_host and "trycloudflare.com" in portal_host and portal_host not in ("Pending...", "Unknown"):
-        try:
-            socket.getaddrinfo(portal_host, 443, proto=socket.IPPROTO_TCP)
-        except Exception as e_dns:
-            print(f"[Watchdog Health] Portal tunnel {portal_host} has expired in DNS ({e_dns}). Restarting sub tunnel...")
-            p_sub = tunnel_state.get("sub_process")
-            if p_sub and p_sub.poll() is None:
-                try:
-                    p_sub.kill()
-                except Exception:
-                    pass
-            existing_cf = get_running_cloudflared_ports()
-            if PORTAL_PORT in existing_cf:
-                try:
-                    subprocess.run(["taskkill", "/f", "/pid", str(existing_cf[PORTAL_PORT])], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                except Exception:
-                    pass
-            tunnel_state.pop("sub_process", None)
+    vpn_created = tunnel_created_time.get("cf-vpn", 0)
+
+    # Initial grace period: allow 45s for newly provisioned tunnels to settle
+    if (now - sub_created < 45) or (now - vpn_created < 45):
+        return
+
+    portal_ok = check_portal_tunnel_alive(portal_host)
+    vpn_ok = check_vpn_tunnel_alive(vpn_host)
+
+    if portal_ok and vpn_ok:
+        if tunnel_consecutive_failures > 0:
+            print(f"[Watchdog Health] Both tunnels verified operational (VPN={vpn_host}, Portal={portal_host})")
+        tunnel_consecutive_failures = 0
+        return
+
+    tunnel_consecutive_failures += 1
+    print(f"[Watchdog Health] Probe failed (Cycle {tunnel_consecutive_failures}/2): Portal={portal_ok}, VPN={vpn_ok}")
+
+    # Confirm failure on 2 consecutive probe cycles before terminating
+    if tunnel_consecutive_failures >= 2:
+        reason_items = []
+        if not vpn_ok:
+            reason_items.append(f"عدم پاسخگویی سرور VPN ({vpn_host or 'نامشخص'})")
+        if not portal_ok:
+            reason_items.append(f"عدم دسترسی به پورتال مدیریت ({portal_host or 'نامشخص'})")
+        failure_msg = " و ".join(reason_items)
+
+        if now - last_disconnect_alert_sent > 300:
+            last_disconnect_alert_sent = now
+            send_telegram_alert_async(
+                "🚨 <b>هشدار فوری: قطعی تونل کلودفلر وی‌پی‌ان!</b>\n\n"
+                f"⚠️ <b>علت قطعی:</b> {failure_msg}\n\n"
+                "🛠️ <b>اقدام خودکار سیستم:</b>\n"
+                "سیستم خوددرمانی فعال شد. در حال راه‌اندازی مجدد تونل‌ها و به‌روزرسانی خودکار اشتراک‌های دائمی روی گیت‌هاب پیج..."
+            )
+
+        # Terminate stale cloudflared processes
+        existing_cf = get_running_cloudflared_ports()
+        for p_port, pid in existing_cf.items():
+            try:
+                subprocess.run(["taskkill", "/f", "/pid", str(pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+
+        tunnel_state.pop("vpn_process", None)
+        tunnel_state.pop("sub_process", None)
+        if not vpn_ok:
+            tunnel_state.pop("vpn_host", None)
+        if not portal_ok:
             tunnel_state.pop("portal_host", None)
             tunnel_state.pop("sub_host", None)
 
-    # 2. Check VPN tunnel DNS (with 60s initial grace period for propagation)
-    vpn_host = tunnel_state.get("vpn_host")
-    vpn_created = tunnel_created_time.get("cf-vpn", 0)
-    if (now - vpn_created > 60) and vpn_host and "trycloudflare.com" in vpn_host and vpn_host not in ("Pending...", "Unknown"):
-        try:
-            socket.getaddrinfo(vpn_host, 443, proto=socket.IPPROTO_TCP)
-        except Exception as e_dns:
-            print(f"[Watchdog Health] VPN tunnel {vpn_host} has expired in DNS ({e_dns}). Restarting VPN tunnel...")
-            p_vpn = tunnel_state.get("vpn_process")
-            if p_vpn and p_vpn.poll() is None:
-                try:
-                    p_vpn.kill()
-                except Exception:
-                    pass
-            existing_cf = get_running_cloudflared_ports()
-            if VPN_PORT in existing_cf:
-                try:
-                    subprocess.run(["taskkill", "/f", "/pid", str(existing_cf[VPN_PORT])], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                except Exception:
-                    pass
-            tunnel_state.pop("vpn_process", None)
-            tunnel_state.pop("vpn_host", None)
+        tunnel_consecutive_failures = 0
+        tunnel_state["watchdog_status"] = "Healing Disconnected Tunnels..."
+        print("[Watchdog Health] Terminated stale tunnels. Initiating self-healing restart...")
 
 def watchdog_loop():
     while True:
