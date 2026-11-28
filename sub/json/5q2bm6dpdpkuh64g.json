@@ -1,0 +1,347 @@
+{
+  "version": 1,
+  "log": {
+    "level": "warn",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "dns-remote",
+        "address": "https://1.1.1.1/dns-query",
+        "address_resolver": "dns-iran",
+        "strategy": "ipv4_only",
+        "detour": "proxy"
+      },
+      {
+        "tag": "dns-iran",
+        "address": "178.22.122.100",
+        "address_resolver": "dns-direct",
+        "strategy": "ipv4_only",
+        "detour": "direct"
+      },
+      {
+        "tag": "dns-direct",
+        "address": "local",
+        "detour": "direct"
+      }
+    ],
+    "rules": [
+      {
+        "outbound": "any",
+        "server": "dns-iran"
+      },
+      {
+        "domain_suffix": [
+          ".ir"
+        ],
+        "server": "dns-iran"
+      },
+      {
+        "domain": [
+          "blubank.com",
+          "sb24.ir",
+          "bmi.ir",
+          "mellatbank.ir",
+          "tejaratbank.ir",
+          "saderat.ir",
+          "shaparak.ir",
+          "snapp.ir",
+          "digikala.com",
+          "divar.ir",
+          "torob.com",
+          "arvancloud.ir",
+          "cafebazaar.ir",
+          "tapsi.ir",
+          "rubika.ir",
+          "bankpasargad.com"
+        ],
+        "server": "dns-iran"
+      }
+    ],
+    "final": "dns-remote",
+    "independent_cache": true
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "interface_name": "tun0",
+      "inet4_address": "172.19.0.1/30",
+      "auto_route": true,
+      "strict_route": true,
+      "stack": "system",
+      "sniff": true
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "selector",
+      "tag": "proxy",
+      "outbounds": [
+        "auto-best",
+        "proxy-fastest-clean",
+        "proxy-clean-2",
+        "proxy-clean-3",
+        "proxy-clean-4",
+        "proxy-clean-5",
+        "proxy-direct-dns"
+      ],
+      "default": "auto-best"
+    },
+    {
+      "type": "urltest",
+      "tag": "auto-best",
+      "outbounds": [
+        "proxy-fastest-clean",
+        "proxy-clean-2",
+        "proxy-clean-3",
+        "proxy-clean-4",
+        "proxy-clean-5",
+        "proxy-direct-dns"
+      ],
+      "url": "http://www.google.com/generate_204",
+      "interval": "3m",
+      "tolerance": 50
+    },
+    {
+      "type": "vless",
+      "tag": "proxy-fastest-clean",
+      "server": "162.159.38.1",
+      "server_port": 443,
+      "uuid": "e2a2ea80-06f1-4f96-81b6-182f1997201d",
+      "tls": {
+        "enabled": true,
+        "server_name": "whale-trucks-penalties-soundtrack.trycloudflare.com",
+        "insecure": false,
+        "alpn": [
+          "http/1.1"
+        ],
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        },
+        "fragment": true,
+        "fragment_fallback_delay": "500ms"
+      },
+      "transport": {
+        "type": "ws",
+        "path": "/vpn-ws",
+        "headers": {
+          "Host": "whale-trucks-penalties-soundtrack.trycloudflare.com"
+        }
+      },
+      "multiplex": {
+        "enabled": false
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "proxy-clean-2",
+      "server": "104.18.2.161",
+      "server_port": 443,
+      "uuid": "e2a2ea80-06f1-4f96-81b6-182f1997201d",
+      "tls": {
+        "enabled": true,
+        "server_name": "whale-trucks-penalties-soundtrack.trycloudflare.com",
+        "insecure": false,
+        "alpn": [
+          "http/1.1"
+        ],
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        },
+        "fragment": true,
+        "fragment_fallback_delay": "500ms"
+      },
+      "transport": {
+        "type": "ws",
+        "path": "/vpn-ws",
+        "headers": {
+          "Host": "whale-trucks-penalties-soundtrack.trycloudflare.com"
+        }
+      },
+      "multiplex": {
+        "enabled": false
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "proxy-clean-3",
+      "server": "162.159.36.1",
+      "server_port": 443,
+      "uuid": "e2a2ea80-06f1-4f96-81b6-182f1997201d",
+      "tls": {
+        "enabled": true,
+        "server_name": "whale-trucks-penalties-soundtrack.trycloudflare.com",
+        "insecure": false,
+        "alpn": [
+          "http/1.1"
+        ],
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        },
+        "fragment": true,
+        "fragment_fallback_delay": "500ms"
+      },
+      "transport": {
+        "type": "ws",
+        "path": "/vpn-ws",
+        "headers": {
+          "Host": "whale-trucks-penalties-soundtrack.trycloudflare.com"
+        }
+      },
+      "multiplex": {
+        "enabled": false
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "proxy-clean-4",
+      "server": "104.19.141.130",
+      "server_port": 443,
+      "uuid": "e2a2ea80-06f1-4f96-81b6-182f1997201d",
+      "tls": {
+        "enabled": true,
+        "server_name": "whale-trucks-penalties-soundtrack.trycloudflare.com",
+        "insecure": false,
+        "alpn": [
+          "http/1.1"
+        ],
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        },
+        "fragment": true,
+        "fragment_fallback_delay": "500ms"
+      },
+      "transport": {
+        "type": "ws",
+        "path": "/vpn-ws",
+        "headers": {
+          "Host": "whale-trucks-penalties-soundtrack.trycloudflare.com"
+        }
+      },
+      "multiplex": {
+        "enabled": false
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "proxy-clean-5",
+      "server": "104.18.43.147",
+      "server_port": 443,
+      "uuid": "e2a2ea80-06f1-4f96-81b6-182f1997201d",
+      "tls": {
+        "enabled": true,
+        "server_name": "whale-trucks-penalties-soundtrack.trycloudflare.com",
+        "insecure": false,
+        "alpn": [
+          "http/1.1"
+        ],
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        },
+        "fragment": true,
+        "fragment_fallback_delay": "500ms"
+      },
+      "transport": {
+        "type": "ws",
+        "path": "/vpn-ws",
+        "headers": {
+          "Host": "whale-trucks-penalties-soundtrack.trycloudflare.com"
+        }
+      },
+      "multiplex": {
+        "enabled": false
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "proxy-direct-dns",
+      "server": "whale-trucks-penalties-soundtrack.trycloudflare.com",
+      "server_port": 443,
+      "uuid": "e2a2ea80-06f1-4f96-81b6-182f1997201d",
+      "tls": {
+        "enabled": true,
+        "server_name": "whale-trucks-penalties-soundtrack.trycloudflare.com",
+        "insecure": false,
+        "alpn": [
+          "http/1.1"
+        ],
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        },
+        "fragment": true,
+        "fragment_fallback_delay": "500ms"
+      },
+      "transport": {
+        "type": "ws",
+        "path": "/vpn-ws",
+        "headers": {
+          "Host": "whale-trucks-penalties-soundtrack.trycloudflare.com"
+        }
+      },
+      "multiplex": {
+        "enabled": false
+      }
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    },
+    {
+      "type": "dns",
+      "tag": "dns-out"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "protocol": "dns",
+        "outbound": "dns-out"
+      },
+      {
+        "ip_is_private": true,
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          ".ir"
+        ],
+        "outbound": "direct"
+      },
+      {
+        "domain": [
+          "blubank.com",
+          "sb24.ir",
+          "bmi.ir",
+          "mellatbank.ir",
+          "tejaratbank.ir",
+          "saderat.ir",
+          "shaparak.ir",
+          "snapp.ir",
+          "digikala.com",
+          "divar.ir",
+          "torob.com",
+          "arvancloud.ir",
+          "cafebazaar.ir",
+          "tapsi.ir",
+          "rubika.ir",
+          "bankpasargad.com"
+        ],
+        "outbound": "direct"
+      }
+    ],
+    "final": "proxy",
+    "auto_detect_interface": true
+  }
+}

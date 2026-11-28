@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <title>اشتراک اختصاصی فیلترشکن خانواده | Maman</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root {
+      --primary: #6366f1;
+      --primary-hover: #4f46e5;
+      --bg: #090d16;
+      --card-bg: rgba(17, 24, 39, 0.85);
+      --border: rgba(255, 255, 255, 0.1);
+      --text: #f3f4f6;
+      --text-muted: #9ca3af;
+    }
+    * { box-sizing: border-box; }
+    body {
+      background: radial-gradient(circle at 50% 10%, #1e1b4b 0%, #090d16 100%);
+      color: var(--text);
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      min-height: 100vh;
+      margin: 0;
+      padding: 2rem 1rem;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      direction: rtl;
+    }
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      backdrop-filter: blur(20px);
+      border-radius: 24px;
+      padding: 2.25rem;
+      max-width: 520px;
+      width: 100%;
+      text-align: center;
+      box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.7);
+    }
+    .avatar {
+      width: 64px;
+      height: 64px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, #6366f1, #a855f7);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 28px;
+      margin: 0 auto 1.25rem auto;
+      box-shadow: 0 0 25px rgba(99, 102, 241, 0.5);
+    }
+    h1 { font-size: 1.4rem; font-weight: 800; margin: 0 0 0.5rem 0; color: #fff; }
+    .badge {
+      display: inline-block;
+      background: rgba(16, 185, 129, 0.15);
+      color: #34d399;
+      border: 1px solid rgba(16, 185, 129, 0.3);
+      padding: 0.25rem 0.75rem;
+      border-radius: 9999px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      margin-bottom: 1.5rem;
+    }
+    .btn-group { display: flex; flex-direction: column; gap: 0.75rem; margin-bottom: 1.5rem; }
+    .btn {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.5rem;
+      padding: 0.875rem 1.25rem;
+      border-radius: 14px;
+      font-size: 0.95rem;
+      font-weight: 700;
+      cursor: pointer;
+      text-decoration: none;
+      transition: all 0.2s;
+      border: none;
+    }
+    .btn-hiddify {
+      background: linear-gradient(135deg, #6366f1, #4f46e5);
+      color: #ffffff;
+      box-shadow: 0 4px 15px rgba(99, 102, 241, 0.4);
+    }
+    .btn-hiddify:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(99, 102, 241, 0.6); }
+    .btn-secondary {
+      background: rgba(255, 255, 255, 0.06);
+      color: #e2e8f0;
+      border: 1px solid var(--border);
+    }
+    .btn-secondary:hover { background: rgba(255, 255, 255, 0.12); }
+    .link-box {
+      background: rgba(0, 0, 0, 0.3);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 0.75rem 1rem;
+      font-family: monospace;
+      font-size: 0.8rem;
+      color: #cbd5e1;
+      word-break: break-all;
+      direction: ltr;
+      text-align: left;
+      margin-bottom: 1.5rem;
+      user-select: all;
+    }
+    .features {
+      text-align: right;
+      font-size: 0.825rem;
+      color: var(--text-muted);
+      line-height: 1.8;
+      border-top: 1px solid var(--border);
+      padding-top: 1.25rem;
+    }
+    .features li { list-style: none; margin-bottom: 0.4rem; display: flex; align-items: center; gap: 0.5rem; }
+    .toast {
+      visibility: hidden;
+      min-width: 200px;
+      background-color: #10b981;
+      color: #fff;
+      text-align: center;
+      border-radius: 8px;
+      padding: 10px;
+      position: fixed;
+      z-index: 100;
+      bottom: 30px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-size: 0.875rem;
+    }
+    .toast.show { visibility: visible; animation: fadeInOut 2.5s; }
+    @keyframes fadeInOut {
+      0% { opacity: 0; bottom: 20px; }
+      15% { opacity: 1; bottom: 30px; }
+      85% { opacity: 1; bottom: 30px; }
+      100% { opacity: 0; bottom: 20px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="avatar">⚡</div>
+    <h1>اشتراک اختصاصی Maman</h1>
+    <div class="badge">🟢 متصل به سرور خانگی ایرلند (Always-Active)</div>
+
+    <div class="btn-group">
+      <a class="btn btn-hiddify" href="hiddify://install-sub?url=https%3A//tohid-sargol.github.io/family-home-vpn/sub/5q2bm6dpdpkuh64g.json&name=FamilyVPN-Maman">
+        🚀 افزودن مستقیم به هیدیفای (یک کلیک)
+      </a>
+      <button class="btn btn-secondary" onclick="copyText('https://tohid-sargol.github.io/family-home-vpn/sub/5q2bm6dpdpkuh64g.json', 'لینک سابسکریپشن کپی شد!')">
+        📋 کپی لینک سابسکریپشن دائمی (JSON)
+      </button>
+      <button class="btn btn-secondary" onclick="copyText('https://tohid-sargol.github.io/family-home-vpn/sub/5q2bm6dpdpkuh64g.txt', 'لینک سابسکریپشن VLESS کپی شد!')">
+        📋 کپی لینک سابسکریپشن VLESS (برای v2rayNG)
+      </button>
+    </div>
+
+    <div class="link-box" id="subUrl">https://tohid-sargol.github.io/family-home-vpn/sub/5q2bm6dpdpkuh64g.json</div>
+
+    <div class="features">
+      <li>✨ <b>لینک دائمی و بدون قطعی:</b> با تغییر خودکار آدرس سرورها، اتصال شما قطع نمی‌شود.</li>
+      <li>🛡️ <b>سایت‌های ایرانی (Split-Tunneling):</b> بانک‌ها، اسنپ، دیجی‌کالا و اپ‌های داخلی مستقیم و بدون مصرف حجم باز می‌شوند.</li>
+      <li>⚡ <b>ضد فیلترینگ (Anti-DPI):</b> مجهز به ۵ مسیر پاک Anycast کلودفلر و تکه‌تکه‌سازی پکت‌ها (Fragmentation).</li>
+    </div>
+  </div>
+
+  <div id="toast" class="toast">کپی شد!</div>
+
+  <script>
+    function copyText(text, msg) {
+      navigator.clipboard.writeText(text).then(function() {
+        var x = document.getElementById("toast");
+        x.innerText = msg || "کپی شد!";
+        x.className = "toast show";
+        setTimeout(function(){ x.className = x.className.replace("show", ""); }, 2500);
+      });
+    }
+  </script>
+</body>
+</html>
