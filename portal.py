@@ -1119,20 +1119,23 @@ def handle_telegram_command(token: str, chat_id: str, text: str):
             f"🎫 <b>کد دعوت اعضا:</b> <code>{invite_code}</code>"
         )
     elif cmd in ("/status", "وضعیت", "استاتوس"):
+        portal_host = get_clean_portal_host()
+        vpn_host = get_clean_vpn_host()
         clients_info = get_clients_list_internal()
         total_members = len(clients_info.get("clients", []))
         online_count = sum(1 for c in clients_info.get("clients", []) if c.get("is_online"))
         total_bw = clients_info.get("total_used_str", "0 B")
         watchdog = tunnel_state.get("watchdog_status", "Healthy")
 
+        portal_status = f"🟢 آنلاین\n<code>https://{portal_host}</code>" if (portal_host and "trycloudflare.com" in portal_host) else "🟡 در حال اتصال به کلودفلر..."
+        vpn_status = f"🟢 فعال و متصل\n<code>{vpn_host}</code>" if (vpn_host and "trycloudflare.com" in vpn_host) else "🟡 در حال برقراری..."
+
         reply = (
             "📊 <b>گزارش لحظه‌ای وضعیت سامانه فیلترشکن خانواده:</b>\n\n"
-            f"🌐 <b>پورتال مدیریت وب:</b> 🟢 آنلاین\n"
-            f"<code>https://{portal_host}</code>\n\n"
+            f"🌐 <b>پورتال مدیریت وب:</b> {portal_status}\n\n"
             f"🔗 <b>پورتال دائمی گیت‌هاب:</b>\n"
             f"<code>{GH_PAGES_BASE_URL}</code>\n\n"
-            f"🛡️ <b>هسته تونل VLESS:</b> 🟢 فعال\n"
-            f"<code>{vpn_host}</code>\n\n"
+            f"🛡️ <b>هسته تونل VLESS:</b> {vpn_status}\n\n"
             f"⚡ <b>سریع‌ترین آی‌پی کلودفلر:</b> <code>{best_ip}</code>\n"
             f"⏱️ <b>تاخیر (Latency):</b> {lat} ms\n\n"
             f"👥 <b>آمار کاربران:</b>\n"
@@ -1904,10 +1907,29 @@ def update_tunnel_state_from_request(request: Optional[Request]):
 
 def get_clean_vpn_host() -> str:
     h = tunnel_state.get("vpn_host", "")
-    if not h or h in ("Pending...", "Unknown", "127.0.0.1", "Initializing..."):
+    if not h or h in ("Pending...", "Unknown", "127.0.0.1", "Initializing...", "Connecting..."):
+        # 1. Fallback to 3x-ui.db inbound wsSettings
+        try:
+            if os.path.exists(DB_PATH):
+                conn = sqlite3.connect(DB_PATH, timeout=2.0)
+                cur = conn.cursor()
+                cur.execute("SELECT stream_settings FROM inbounds WHERE port = ?", (VPN_PORT,))
+                row = cur.fetchone()
+                conn.close()
+                if row and row[0]:
+                    ss = json.loads(row[0])
+                    candidate = ss.get("wsSettings", {}).get("headers", {}).get("Host", "").strip()
+                    if candidate and "trycloudflare.com" in candidate:
+                        h = candidate
+                        tunnel_state["vpn_host"] = h
+                        tunnel_state["vpn_url"] = f"https://{h}"
+        except Exception:
+            pass
+
+    if not h or h in ("Pending...", "Unknown", "127.0.0.1", "Initializing...", "Connecting..."):
         detect_tunnel_urls_from_logs()
         h = tunnel_state.get("vpn_host", "")
-    if not h or h in ("Pending...", "Unknown", "127.0.0.1", "Initializing..."):
+    if not h or h in ("Pending...", "Unknown", "127.0.0.1", "Initializing...", "Connecting..."):
         return "127.0.0.1"
     return h
 
@@ -1915,10 +1937,28 @@ def get_clean_portal_host(request: Optional[Request] = None) -> str:
     if request:
         update_tunnel_state_from_request(request)
     h = tunnel_state.get("portal_host", "")
-    if not h or h in ("Pending...", "Unknown", "127.0.0.1", "Initializing..."):
+    if not h or h in ("Pending...", "Unknown", "127.0.0.1", "Initializing...", "Connecting..."):
+        # 1. Fallback to gh_pages_sync_state.json
+        try:
+            state_file = os.path.join(BASE_DIR, "gh_pages_sync_state.json")
+            if os.path.exists(state_file):
+                with open(state_file, "r", encoding="utf-8") as f:
+                    st = json.load(f)
+                    url = st.get("last_synced_url", "")
+                    candidate = url.replace("https://", "").replace("http://", "").strip().rstrip("/")
+                    if candidate and "trycloudflare.com" in candidate:
+                        h = candidate
+                        tunnel_state["portal_host"] = h
+                        tunnel_state["portal_url"] = f"https://{h}"
+                        tunnel_state["sub_host"] = h
+                        tunnel_state["sub_url"] = f"https://{h}"
+        except Exception:
+            pass
+
+    if not h or h in ("Pending...", "Unknown", "127.0.0.1", "Initializing...", "Connecting..."):
         detect_tunnel_urls_from_logs()
         h = tunnel_state.get("portal_host", "")
-    if not h or h in ("Pending...", "Unknown", "127.0.0.1", "Initializing..."):
+    if not h or h in ("Pending...", "Unknown", "127.0.0.1", "Initializing...", "Connecting..."):
         return ""
     return h
 
